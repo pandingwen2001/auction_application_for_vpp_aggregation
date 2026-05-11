@@ -14,25 +14,16 @@ to include:
     - WT scaled by wt_factor[t]
     - MT/DR capacity is time-invariant (equipment-level, not weather-driven)
   - Time-varying day-ahead grid price (pi_DA_profile [T])
-  - MT ramp limits and DR cumulative caps (Phase 1b+ only)
-  - ESS parameters (Phase 2+ only)
+  - ESS parameters
 
 Topology (buses, lines, DER-to-bus mapping, impedances) is IDENTICAL to the
 single-period network — only time-varying quantities are added.
-
-Phase gating:
-  Phase 1a : uses only {load_profile, x_bar_profile, pi_DA_profile}
-             — ramp/DR/ESS params are stored in net dict but not consumed
-             by the OPF layer.
-  Phase 1b : additionally uses mt_ramp and dr_energy_max.
-  Phase 2  : additionally uses ess_* params.
 
 Returned `net_multi` dict contains:
   * All single-period fields (topology, impedances, DER metadata, cost bounds)
   * Per-timestep quantities:
       T                          : int
       load_profile               [T]
-      load_total_profile         [T]   (= load_profile for compatibility)
       x_bar_profile              [T, N]
       pi_DA_profile              [T]
       flow_margin_up_profile     [T, n_lines]
@@ -40,9 +31,7 @@ Returned `net_multi` dict contains:
       volt_margin_up_profile     [T, n_buses]
       volt_margin_dn_profile     [T, n_buses]
       v_base_profile             [T, n_buses]
-  * Phase 1b / 2 parameters (not yet consumed in Phase 1a):
-      mt_ramp                    [N_mt]
-      dr_energy_max              [N_dr]
+  * ESS parameters:
       ess_params                 dict
 """
 
@@ -229,9 +218,8 @@ def build_network_multi(base_load_mw: float = None,
     volt_margin_dn_profile = v_base_profile - base["v_min"]
 
     # ------------------------------------------------------------------
-    # Phase 1b / Phase 2 parameters
+    # ESS parameters
     # ------------------------------------------------------------------
-    mt_ramp       = profiles["mt_ramp"]
     ess_params    = profiles["ess_params"]
 
     mt_indices = np.array([i for i, t_ in enumerate(der_type) if t_ == "MT"],
@@ -261,7 +249,6 @@ def build_network_multi(base_load_mw: float = None,
         T                       = T,
         # Time-varying profiles
         load_profile            = load_profile,          # [T]
-        load_total_profile      = load_profile,          # alias for clarity
         pv_factor               = pv_factor,             # [T]
         wt_factor               = wt_factor,             # [T]
         x_bar                   = x_bar,                 # [N] (scaled PV)
@@ -279,7 +266,6 @@ def build_network_multi(base_load_mw: float = None,
         pv_scale                = pv_scale,
         ctrl_min_ratio          = ctrl_min_ratio,        # min controllable gen ratio
         re_indices              = re_indices,             # renewable DER indices
-        mt_ramp                 = mt_ramp,               # [N_mt]
         mt_indices              = mt_indices,
         dr_indices              = dr_indices,
         # ESS
@@ -433,15 +419,12 @@ if __name__ == "__main__":
           f"{net['volt_margin_up_profile'].max():.4f}")
     print()
 
-    print("  Phase 1b params (placeholder, not used yet):")
+    print("  DER indices:")
     print(f"    mt_indices    : {net['mt_indices']}")
     print(f"    dr_indices    : {net['dr_indices']}")
-    print(f"    mt_ramp       : {net['mt_ramp']}")
-    print(f"    dr_energy_max : {net['dr_energy_max']}")
     print()
 
-    print("  Phase 2 params (placeholder, not used yet):")
-    print(f"    ess_params    : {net['ess_params']}")
+    print(f"  ess_params    : {net['ess_params']}")
     print()
 
     # Feasibility test

@@ -5,11 +5,12 @@ vpp_mechanism_multi.py
 ----------------------
 Multi-period (24h) VPP posted-price mechanism.
 
-Architecture (per 24h_extension_guide.md §6):
+Architecture:
 
   Stage 1 — PostedPriceNetworkMulti
-    Input:  public context [B, T, N, F_ctx] and DER technology class
-    Output: rho [B, T, N], a bid-independent posted price schedule
+    Input:  public context [B, T, N, F_ctx], DER technology class,
+            optional leave-one-out peer-bid aggregates
+    Output: rho [B, T, N], own-bid-excluded posted price schedule
 
   Stage 2 — DC3OPFLayerMulti
     Input:  rho [B, T, N] plus accepted supply caps from reported bids
@@ -17,14 +18,8 @@ Architecture (per 24h_extension_guide.md §6):
 
   Stage 3 — posted-price payment rule
     p_i = Σ_t rho_{i,t} x_{i,t}        [B, N]
-    Prices are fixed before current bids, so bids affect quantity but not
-    the price paid for that quantity.
-
-Key differences from single-period vpp_mechanism.py:
-  - Current bids no longer enter the price network
-  - Reported costs only determine accepted supply caps at posted prices
-  - utility() sums cost over T timesteps
-  - system_cost() uses time-varying pi_DA_profile
+    Prices are bid-independent (own-bid excluded), so bids affect quantity
+    but not the price paid for that quantity.
 """
 
 import os
@@ -74,9 +69,8 @@ class MultiPeriodContextBuilder:
         load_max  = max(float(load_prof.max()),  1e-9)
         pi_DA_max = max(float(pi_DA_prof.max()), 1e-9)
 
-        # Broadcasted context [T, N, F_ctx]
         ctx = np.zeros((T, N, self.N_CTX_FEATURES), dtype=np.float32)
-        ctx[..., 0] = x_bar_prof / x_bar_nom[None, :]           # per-t capacity / nominal
+        ctx[..., 0] = x_bar_prof / x_bar_nom[None, :]
         ctx[..., 1] = (load_prof  / load_max)[:, None]
         ctx[..., 2] = (pi_DA_prof / pi_DA_max)[:, None]
 
@@ -95,193 +89,6 @@ class MultiPeriodContextBuilder:
 
 
 # ===========================================================================
-# Factored Attention Backbone
-# ===========================================================================
-
-class FactoredAttentionBlock(nn.Module):
-    """
-    One factored (spatial + temporal) attention block.
-
-    Input:  x [B, T, N, d]
-    Step A: Spatial attention   (attend across N for each (b, t))
-    Step B: Temporal attention  (attend across T for each (b, n))
-    Output: [B, T, N, d]
-
-    Both sub-attentions use pre-LayerNorm + residual.
-    Feed-forward at the end.
-    """
-
-    def __init__(self, d_model: int, nhead: int, dim_feedforward: int,
-                 dropout: float = 0.0):
-        super().__init__()
-        self.spatial_norm = nn.LayerNorm(d_model)
-        self.spatial_attn = nn.MultiheadAttention(
-            d_model, nhead, dropout=dropout, batch_first=True)
-
-        self.temporal_norm = nn.LayerNorm(d_model)
-        self.temporal_attn = nn.MultiheadAttention(
-            d_model, nhead, dropout=dropout, batch_first=True)
-
-        self.ffn_norm = nn.LayerNorm(d_model)
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, dim_feedforward),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(dim_feedforward, d_model),
-            nn.Dropout(dropout),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x : [B, T, N, d] → [B, T, N, d]"""
-        B, T, N, d = x.shape
-
-        # --- Spatial attention: attend across N within each (B, T) ---
-        # Reshape to [(B*T), N, d]
-        x_sp = x.reshape(B * T, N, d)
-        h_sp = self.spatial_norm(x_sp)
-        h_sp, _ = self.spatial_attn(h_sp, h_sp, h_sp, need_weights=False)
-        x_sp = x_sp + h_sp
-        x = x_sp.reshape(B, T, N, d)
-
-        # --- Temporal attention: attend across T within each (B, N) ---
-        # Permute to [B, N, T, d], then reshape to [(B*N), T, d]
-        x_tp = x.permute(0, 2, 1, 3).reshape(B * N, T, d)
-        h_tp = self.temporal_norm(x_tp)
-        h_tp, _ = self.temporal_attn(h_tp, h_tp, h_tp, need_weights=False)
-        x_tp = x_tp + h_tp
-        # Back to [B, T, N, d]
-        x = x_tp.reshape(B, N, T, d).permute(0, 2, 1, 3).contiguous()
-
-        # --- Feed-forward ---
-        h = self.ffn_norm(x)
-        h = self.ffn(h)
-        x = x + h
-
-        return x
-
-
-# ===========================================================================
-# ShadowPriceTransformerMulti
-# ===========================================================================
-
-class ShadowPriceTransformerMulti(nn.Module):
-    """
-    Multi-period shadow price + payment network.
-
-    Inputs
-    ------
-    bids    : [B, N, 2]           per-DER reported (a, b)
-    context : [B, T, N, F_ctx]    time-varying context features
-
-    Outputs
-    -------
-    pi_tilde : [B, T, N]   dispatch shadow price (positive, via softplus)
-    price    : [B, N]      daily unit price    (positive, via softplus)
-
-    Architecture
-    ------------
-    Token embedding: concat(bids expanded over T, context) → Linear → [B, T, N, d_model]
-    L stacked FactoredAttentionBlock layers
-    Heads:
-      Dispatch head: Linear(d_model, 1) → pi_tilde [B, T, N]
-      Payment head : temporal attention-pool over T → [B, N, d_model]
-                     → Linear(d_model, 1) → price [B, N]
-    """
-
-    def __init__(self, T: int, N: int, F_ctx: int = 5,
-                 d_model: int = 64, nhead: int = 4, num_layers: int = 3,
-                 dim_feedforward: int = 128, dropout: float = 0.0,
-                 cost_bias_init: tuple = (5.0, 5.0)):
-        super().__init__()
-        self.T = T
-        self.N = N
-        self.F_ctx = F_ctx
-        self.d_model = d_model
-        self.cost_bias_init = cost_bias_init   # (a'_init, b'_init)
-
-        # Token embedding: bid (2) + context (F_ctx) = 2+F_ctx → d_model
-        self.token_embed = nn.Linear(2 + F_ctx, d_model)
-
-        # Backbone
-        self.blocks = nn.ModuleList([
-            FactoredAttentionBlock(d_model, nhead, dim_feedforward, dropout)
-            for _ in range(num_layers)
-        ])
-        self.backbone_norm = nn.LayerNorm(d_model)
-
-        # Dispatch head
-        self.dispatch_head = nn.Linear(d_model, 1)
-
-        # Payment head: outputs (a'_i, b'_i) per DER — the network's estimate
-        # of each DER's true quadratic cost parameters.  Payment is then
-        #   p_i = Σ_t (a'_i * x_{i,t}^2 + b'_i * x_{i,t})
-        # which matches the quadratic cost structure exactly, enabling near-zero
-        # info rent when a' ≈ a and b' ≈ b.
-        self.pool_query = nn.Parameter(torch.zeros(1, N, d_model))
-        self.pool_attn = nn.MultiheadAttention(
-            d_model, nhead, dropout=dropout, batch_first=True)
-        self.payment_norm = nn.LayerNorm(d_model)
-        self.payment_head = nn.Linear(d_model, 2)   # outputs (a', b')
-
-        self._init_weights()
-
-    def _init_weights(self):
-        for p in self.parameters():
-            if p.dim() > 1:
-                nn.init.xavier_uniform_(p)
-        nn.init.normal_(self.pool_query, std=0.02)
-
-        # Payment head: initialise softplus bias so a' ≈ cost_bias_init[0],
-        # b' ≈ cost_bias_init[1].  These are typical mid-range values for the
-        # DER cost parameters (a ranges ~0-50, b ranges ~3-10).
-        nn.init.xavier_uniform_(self.payment_head.weight, gain=0.1)
-        a_init, b_init = self.cost_bias_init
-        inv_a = math.log(math.expm1(a_init)) if a_init < 20.0 else a_init
-        inv_b = math.log(math.expm1(b_init)) if b_init < 20.0 else b_init
-        self.payment_head.bias.data = torch.tensor([inv_a, inv_b],
-                                                    dtype=torch.float32)
-
-    def forward(self, bids: torch.Tensor, context: torch.Tensor):
-        """
-        bids    : [B, N, 2]
-        context : [B, T, N, F_ctx]
-        Returns:
-          pi_tilde   [B, T, N]    dispatch shadow prices
-          cost_pred  [B, N, 2]    predicted cost params (a', b'), non-negative
-        """
-        B, N, _ = bids.shape
-        T = context.shape[1]
-        assert N == self.N
-        assert T == self.T
-
-        # Broadcast bids over T: [B, N, 2] → [B, T, N, 2]
-        bids_bcast = bids.unsqueeze(1).expand(-1, T, -1, -1)
-
-        # Concat features: [B, T, N, 2+F_ctx]
-        tokens = torch.cat([bids_bcast, context], dim=-1)
-        tokens = self.token_embed(tokens)                               # [B, T, N, d]
-
-        # Backbone
-        for block in self.blocks:
-            tokens = block(tokens)
-        tokens = self.backbone_norm(tokens)                             # [B, T, N, d]
-
-        # --- Dispatch head (per t, per i) ---
-        pi_tilde = F.softplus(self.dispatch_head(tokens).squeeze(-1))   # [B, T, N]
-
-        # --- Payment head: estimate (a', b') per DER ---
-        tokens_bn = tokens.permute(0, 2, 1, 3).reshape(B * N, T, self.d_model)
-        q = self.pool_query.expand(B, -1, -1).reshape(B * N, 1, self.d_model)
-        pooled, _ = self.pool_attn(q, tokens_bn, tokens_bn, need_weights=False)
-        pooled = pooled.squeeze(1)                                      # [(B*N), d]
-        pooled = self.payment_norm(pooled)
-        cost_raw = self.payment_head(pooled)                            # [(B*N), 2]
-        cost_pred = F.softplus(cost_raw).view(B, N, 2)                 # [B, N, 2]
-
-        return pi_tilde, cost_pred
-
-
-# ===========================================================================
 # Bid-independent posted-price network
 # ===========================================================================
 
@@ -296,12 +103,9 @@ class PostedPriceNetworkMulti(nn.Module):
 
     The total posted price is represented as
 
-        rho_total =
-            rho_base + rho_type + rho_security + rho_scarcity + rho_peer_bid
+        rho_total = rho_base + rho_type + rho_security + rho_scarcity + rho_peer_bid
 
-    before the final floor/cap projection.  The legacy MLP is retained as the
-    initial type/context adder so existing checkpoints still reproduce their
-    old prices when the new heads are zero-initialised.
+    before the final floor/cap projection.
     """
 
     TYPE_ORDER = ("PV", "WT", "DG", "MT", "DR")
@@ -330,22 +134,12 @@ class PostedPriceNetworkMulti(nn.Module):
                  init_gate_by_type: dict = None,
                  type_embed_dim: int = 4,
                  use_peer_bid_context: bool = False,
-                 peer_bid_scale: float = 0.25,
-                 price_arch: str = "mlp",
-                 transformer_layers: int = 2,
-                 transformer_heads: int = 4,
-                 transformer_dropout: float = 0.0):
+                 peer_bid_scale: float = 0.25):
         super().__init__()
         self.T = net_multi["T"]
         self.N = net_multi["n_ders"]
         self.use_peer_bid_context = bool(use_peer_bid_context)
         self.peer_bid_scale = float(peer_bid_scale)
-        self.price_arch = str(price_arch).lower()
-        self._component_scale = {}
-        if self.price_arch not in {"mlp", "transformer"}:
-            raise ValueError("price_arch must be 'mlp' or 'transformer'")
-        if hidden % int(transformer_heads) != 0:
-            raise ValueError("price_hidden must be divisible by transformer_heads")
 
         type_cap_ratio = type_cap_ratio or {
             "PV": 0.70,
@@ -410,9 +204,8 @@ class PostedPriceNetworkMulti(nn.Module):
         self.type_offset = nn.Parameter(init_offsets)
         self.type_embed = nn.Embedding(len(self.TYPE_ORDER), type_embed_dim)
 
-        # Legacy type/context adder.  Keep the module name and shape stable so
-        # old checkpoints load cleanly and initialise the decomposed network at
-        # the previous posted-price policy.
+        # Type/context adder. Kept under the legacy name `mlp` so older
+        # checkpoints continue to load.
         self.mlp = nn.Sequential(
             nn.Linear(F_ctx + type_embed_dim, hidden),
             nn.SiLU(),
@@ -422,6 +215,7 @@ class PostedPriceNetworkMulti(nn.Module):
             nn.Linear(hidden, 1),
         )
 
+        # System-level base component: shared across DERs.
         self.system_feature_idx = (1, 2, 3, 4)  # load, DA price, sin(hour), cos(hour)
         self.base_mlp = nn.Sequential(
             nn.Linear(len(self.system_feature_idx), hidden),
@@ -441,53 +235,8 @@ class PostedPriceNetworkMulti(nn.Module):
             nn.LayerNorm(hidden),
             nn.Linear(hidden, 1),
         )
-        self.security_residual_mlp = nn.Sequential(
-            nn.Linear(F_ctx + type_embed_dim, hidden),
-            nn.SiLU(),
-            nn.LayerNorm(hidden),
-            nn.Linear(hidden, 1),
-        )
-        self.scarcity_residual_mlp = nn.Sequential(
-            nn.Linear(F_ctx + type_embed_dim, hidden),
-            nn.SiLU(),
-            nn.LayerNorm(hidden),
-            nn.Linear(hidden, 1),
-        )
         self.peer_bid_mlp = nn.Sequential(
             nn.Linear(F_ctx + type_embed_dim + self.peer_bid_feature_dim, hidden),
-            nn.SiLU(),
-            nn.LayerNorm(hidden),
-            nn.Linear(hidden, 1),
-        )
-
-        # Optional public-context Transformer backbone. It intentionally uses
-        # only public context and DER class embeddings. Bid-aware information is
-        # still added later through pointwise leave-one-out peer features, so
-        # spatial attention cannot leak DER i's own bid into rho_i.
-        self.public_token_proj = nn.Linear(F_ctx + type_embed_dim, hidden)
-        self.public_blocks = nn.ModuleList([
-            FactoredAttentionBlock(
-                d_model=hidden,
-                nhead=int(transformer_heads),
-                dim_feedforward=2 * hidden,
-                dropout=float(transformer_dropout),
-            )
-            for _ in range(int(transformer_layers))
-        ])
-        self.public_norm = nn.LayerNorm(hidden)
-        self.tr_base_head = nn.Sequential(
-            nn.Linear(hidden, hidden),
-            nn.SiLU(),
-            nn.LayerNorm(hidden),
-            nn.Linear(hidden, 1),
-        )
-        self.tr_type_head = nn.Linear(hidden, 1)
-        self.tr_security_head = nn.Linear(hidden, 1)
-        self.tr_scarcity_head = nn.Linear(hidden, 1)
-        self.tr_security_residual_head = nn.Linear(hidden, 1)
-        self.tr_scarcity_residual_head = nn.Linear(hidden, 1)
-        self.tr_peer_bid_mlp = nn.Sequential(
-            nn.Linear(hidden + self.peer_bid_feature_dim, hidden),
             nn.SiLU(),
             nn.LayerNorm(hidden),
             nn.Linear(hidden, 1),
@@ -504,7 +253,6 @@ class PostedPriceNetworkMulti(nn.Module):
         nn.init.zeros_(last.bias)
 
         for head in (self.base_mlp, self.security_mlp, self.scarcity_mlp,
-                     self.security_residual_mlp, self.scarcity_residual_mlp,
                      self.peer_bid_mlp):
             for m in head:
                 if isinstance(m, nn.Linear):
@@ -514,22 +262,6 @@ class PostedPriceNetworkMulti(nn.Module):
             nn.init.zeros_(last.weight)
             nn.init.zeros_(last.bias)
 
-        nn.init.xavier_uniform_(self.public_token_proj.weight)
-        nn.init.zeros_(self.public_token_proj.bias)
-        for head in (self.tr_base_head, self.tr_peer_bid_mlp):
-            for m in head:
-                if isinstance(m, nn.Linear):
-                    nn.init.xavier_uniform_(m.weight)
-                    nn.init.zeros_(m.bias)
-            last = head[-1]
-            nn.init.zeros_(last.weight)
-            nn.init.zeros_(last.bias)
-        for head in (self.tr_type_head, self.tr_security_head,
-                     self.tr_scarcity_head, self.tr_security_residual_head,
-                     self.tr_scarcity_residual_head):
-            nn.init.zeros_(head.weight)
-            nn.init.zeros_(head.bias)
-
     @staticmethod
     def _detach_components(components: dict) -> dict:
         return {
@@ -537,32 +269,6 @@ class PostedPriceNetworkMulti(nn.Module):
             for key, value in components.items()
             if torch.is_tensor(value)
         }
-
-    def reset_component_scale(self):
-        """Restore all price components to their default scale of one."""
-        self._component_scale = {}
-
-    def set_component_scale(self, **scale: float):
-        """
-        Set multiplicative component scales for evaluation ablations.
-
-        Supported keys: base, type, security_main, scarcity_main,
-        security_residual, scarcity_residual, peer_bid.
-        Missing keys default to 1.0. This is intentionally not part of the
-        state_dict so trained checkpoints remain unchanged.
-        """
-        valid = {
-            "base", "type", "security_main", "scarcity_main",
-            "security_residual", "scarcity_residual", "peer_bid",
-        }
-        unknown = set(scale) - valid
-        if unknown:
-            raise ValueError(f"Unknown price component scale keys: {sorted(unknown)}")
-        self._component_scale = {key: float(value)
-                                 for key, value in scale.items()}
-
-    def _scale_component(self, key: str, value: torch.Tensor) -> torch.Tensor:
-        return value * float(self._component_scale.get(key, 1.0))
 
     def _normalise_bids(self, bids: torch.Tensor) -> torch.Tensor:
         denom = (self.bid_hi - self.bid_lo).clamp(min=1e-6)
@@ -607,96 +313,6 @@ class PostedPriceNetworkMulti(nn.Module):
             count_frac.reshape(B, N, K),
         ], dim=-1)
 
-    def _finalize_price(self, floor: torch.Tensor, cap: torch.Tensor,
-                        rho_base: torch.Tensor, rho_type: torch.Tensor,
-                        rho_security_main: torch.Tensor,
-                        rho_scarcity_main: torch.Tensor,
-                        rho_security_residual: torch.Tensor,
-                        rho_scarcity_residual: torch.Tensor,
-                        rho_peer_bid: torch.Tensor,
-                        type_raw: torch.Tensor) -> torch.Tensor:
-        B, T, N = rho_type.shape
-        rho_base = self._scale_component("base", rho_base)
-        rho_type = self._scale_component("type", rho_type)
-        rho_security_main = self._scale_component(
-            "security_main", rho_security_main)
-        rho_scarcity_main = self._scale_component(
-            "scarcity_main", rho_scarcity_main)
-        rho_security_residual = self._scale_component(
-            "security_residual", rho_security_residual)
-        rho_scarcity_residual = self._scale_component(
-            "scarcity_residual", rho_scarcity_residual)
-        rho_peer_bid = self._scale_component("peer_bid", rho_peer_bid)
-        rho_security = rho_security_main + rho_security_residual
-        rho_scarcity = rho_scarcity_main + rho_scarcity_residual
-        rho_unclamped = (rho_base + rho_type + rho_security + rho_scarcity
-                         + rho_peer_bid)
-        rho = torch.max(torch.min(rho_unclamped, cap), floor)
-
-        components = {
-            "rho_base": rho_base,
-            "rho_type": rho_type,
-            "rho_security_main": rho_security_main,
-            "rho_scarcity_main": rho_scarcity_main,
-            "rho_security_residual": rho_security_residual,
-            "rho_scarcity_residual": rho_scarcity_residual,
-            "rho_security": rho_security,
-            "rho_scarcity": rho_scarcity,
-            "rho_peer_bid": rho_peer_bid,
-            "rho_unclamped": rho_unclamped,
-            "rho_total": rho,
-            "rho_floor": floor.expand(B, T, N),
-            "rho_cap": cap,
-            "raw_type": type_raw,
-        }
-        self._last_price_components = components
-        self._last_price_components_detached = self._detach_components(components)
-        return rho
-
-    def _forward_transformer(self, bids: torch.Tensor, features: torch.Tensor,
-                             floor: torch.Tensor, cap: torch.Tensor,
-                             span: torch.Tensor) -> torch.Tensor:
-        B, T, N, _ = features.shape
-
-        h = self.public_token_proj(features)
-        for block in self.public_blocks:
-            h = block(h)
-        h = self.public_norm(h)
-
-        system_h = h.mean(dim=2)
-        base_gate_delta = torch.tanh(self.tr_base_head(system_h).squeeze(-1))
-        rho_base = floor.expand(B, T, N) + span * base_gate_delta.unsqueeze(-1)
-
-        type_raw = self.tr_type_head(h).squeeze(-1)
-        type_raw = type_raw + self.type_offset[self.type_ids].view(1, 1, N)
-        rho_type = span * torch.sigmoid(type_raw)
-
-        rho_security_main = span * torch.tanh(
-            self.tr_security_head(h).squeeze(-1))
-        rho_scarcity_main = span * torch.tanh(
-            self.tr_scarcity_head(h).squeeze(-1))
-        rho_security_residual = span * torch.tanh(
-            self.tr_security_residual_head(h).squeeze(-1))
-        rho_scarcity_residual = span * torch.tanh(
-            self.tr_scarcity_residual_head(h).squeeze(-1))
-
-        if self.use_peer_bid_context:
-            if bids is None:
-                raise ValueError("bids are required when use_peer_bid_context=True")
-            peer_bid = self._peer_bid_features(bids).unsqueeze(1)
-            peer_bid = peer_bid.expand(-1, T, -1, -1)
-            peer_features = torch.cat([h, peer_bid], dim=-1)
-            rho_peer_bid = (self.peer_bid_scale * span * torch.tanh(
-                self.tr_peer_bid_mlp(peer_features).squeeze(-1)))
-        else:
-            rho_peer_bid = torch.zeros_like(rho_type)
-
-        return self._finalize_price(
-            floor, cap, rho_base, rho_type,
-            rho_security_main, rho_scarcity_main,
-            rho_security_residual, rho_scarcity_residual,
-            rho_peer_bid, type_raw)
-
     def forward(self, context: torch.Tensor,
                 bids: torch.Tensor = None) -> torch.Tensor:
         """
@@ -716,31 +332,18 @@ class PostedPriceNetworkMulti(nn.Module):
         cap = self.price_cap_TN.view(1, T, N)
         span = cap - floor
 
-        if self.price_arch == "transformer":
-            return self._forward_transformer(bids, features, floor, cap, span)
-
         # Base component: system-level public signal, shared across DERs.
         system_features = context[:, :, 0, list(self.system_feature_idx)]
         base_gate_delta = torch.tanh(self.base_mlp(system_features).squeeze(-1))
         rho_base = floor.expand(B, T, N) + span * base_gate_delta.unsqueeze(-1)
 
-        # Type/context component: backward-compatible legacy posted-price adder.
+        # Type/context adder.
         type_raw = self.mlp(features).squeeze(-1)
         type_raw = type_raw + self.type_offset[self.type_ids].view(1, 1, N)
         rho_type = span * torch.sigmoid(type_raw)
 
-        # Security/scarcity adders have a main Stage-1 component plus a
-        # zero-initialised residual component for postprocess-dual refinement.
-        rho_security_main = span * torch.tanh(
-            self.security_mlp(features).squeeze(-1))
-        rho_scarcity_main = span * torch.tanh(
-            self.scarcity_mlp(features).squeeze(-1))
-        rho_security_residual = span * torch.tanh(
-            self.security_residual_mlp(features).squeeze(-1))
-        rho_scarcity_residual = span * torch.tanh(
-            self.scarcity_residual_mlp(features).squeeze(-1))
-        rho_security = rho_security_main + rho_security_residual
-        rho_scarcity = rho_scarcity_main + rho_scarcity_residual
+        rho_security = span * torch.tanh(self.security_mlp(features).squeeze(-1))
+        rho_scarcity = span * torch.tanh(self.scarcity_mlp(features).squeeze(-1))
 
         if self.use_peer_bid_context:
             if bids is None:
@@ -753,11 +356,21 @@ class PostedPriceNetworkMulti(nn.Module):
         else:
             rho_peer_bid = torch.zeros_like(rho_type)
 
-        return self._finalize_price(
-            floor, cap, rho_base, rho_type,
-            rho_security_main, rho_scarcity_main,
-            rho_security_residual, rho_scarcity_residual,
-            rho_peer_bid, type_raw)
+        rho_unclamped = rho_base + rho_type + rho_security + rho_scarcity + rho_peer_bid
+        rho = torch.max(torch.min(rho_unclamped, cap), floor)
+
+        components = {
+            "rho_base":      rho_base,
+            "rho_type":      rho_type,
+            "rho_security":  rho_security,
+            "rho_scarcity":  rho_scarcity,
+            "rho_peer_bid":  rho_peer_bid,
+            "rho_unclamped": rho_unclamped,
+            "rho_total":     rho,
+        }
+        self._last_price_components = components
+        self._last_price_components_detached = self._detach_components(components)
+        return rho
 
 
 # ===========================================================================
@@ -794,9 +407,6 @@ class VPPMechanismMulti(nn.Module):
         # DC3 OPF
         self.dc3_opf = dc3_opf or DC3OPFLayerMulti(net_multi)
 
-        # Public posted-price network. Keep shadow_cfg accepted for backward
-        # compatibility with old experiment code; its d_model value is reused
-        # as the default hidden size if supplied.
         cfg = {}
         if shadow_cfg:
             cfg.update(shadow_cfg)
@@ -813,10 +423,6 @@ class VPPMechanismMulti(nn.Module):
             type_embed_dim=cfg.get("type_embed_dim", 4),
             use_peer_bid_context=cfg.get("use_peer_bid_context", False),
             peer_bid_scale=cfg.get("peer_bid_scale", 0.25),
-            price_arch=cfg.get("price_arch", "mlp"),
-            transformer_layers=cfg.get("transformer_layers", 2),
-            transformer_heads=cfg.get("transformer_heads", 4),
-            transformer_dropout=cfg.get("transformer_dropout", 0.0),
         )
         self.register_buffer("x_bar_profile",
             torch.tensor(net_multi["x_bar_profile"], dtype=torch.float32),
@@ -844,14 +450,11 @@ class VPPMechanismMulti(nn.Module):
         supply_cap = self._accepted_supply_cap(bids, rho)     # [B, T, N]
         x, P_VPP = self.dc3_opf(rho, supply_cap=supply_cap)   # [B, T, N], [B, T]
 
-        # Posted-price payment. Current bids can change accepted quantity, but
-        # a DER's own bid is excluded from its own price schedule rho_i.
+        # Posted-price payment. A DER's own bid is excluded from its own price
+        # schedule rho_i; bids only change accepted quantity.
         p = (rho * x).sum(dim=1)                              # [B, N]
 
-        self._last_pi_tilde = rho
-        self._last_posted_price = rho
         self._last_offer_cap = supply_cap
-        self._last_cost_pred = None
         self._last_price_components = getattr(
             self.posted_price_net, "_last_price_components", None)
         self._last_price_components_detached = getattr(
@@ -946,7 +549,6 @@ if __name__ == "__main__":
     dc3 = mech.dc3_opf
     ess_net = dc3._last_P_d - dc3._last_P_c
 
-    # Feasibility, including ESS bus injection.
     flow = (x.detach() @ dc3.A_flow.T
             + ess_net @ dc3.A_flow_ess.T)
     flow_viol = torch.maximum(
@@ -974,14 +576,12 @@ if __name__ == "__main__":
     print(f"  mt_violation    [B]: {mt_viol.detach().numpy().round(6)}")
     print()
 
-    # Power balance per sample (including ESS net injection)
     load = torch.tensor(net["load_profile"], dtype=torch.float32)
     ess_net_sum = (dc3._last_P_d - dc3._last_P_c).sum(dim=-1)   # [B, T]
     res = (x.sum(dim=-1) + ess_net_sum + P_VPP - load.unsqueeze(0)).abs().max().item()
     print(f"  Power balance residual (max): {res:.6f}")
     print()
 
-    # Per-DER summary: posted price and realized payment.
     print(f"  Per-DER posted price summary (sample 0):")
     print(f"    {'DER':<7}  {'a_true':>7} {'b_true':>7}  {'rho_avg':>8} "
           f"{'p':>8}  {'true_cost':>10}")
@@ -992,7 +592,6 @@ if __name__ == "__main__":
               f"{rho[0, :, i].mean().item():8.3f} "
               f"{p[0, i].item():8.3f}  {true_cost[0, i].item():10.3f}")
 
-    # IR verification: u = p - Σ_t cost
     u = mech.utility(types, x.detach(), p.detach())
     print(f"\n  utility [B, N] min = {u.min().item():.6f}  "
           f"(negative means IR violated; before training this may be negative)")
@@ -1000,7 +599,6 @@ if __name__ == "__main__":
     print(f"  sys_cost  = {mech.system_cost(p, P_VPP).item():.4f}")
     print()
 
-    # Gradient flow
     loss = mech.system_cost(p, P_VPP)
     loss.backward()
     n_grad = sum(1 for p_ in mech.parameters() if p_.grad is not None

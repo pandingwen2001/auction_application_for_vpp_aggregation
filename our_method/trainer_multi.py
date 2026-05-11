@@ -15,7 +15,7 @@ Training stability playbook (§8.5 of 24h_extension_guide.md):
   1. Curriculum on T          — external; this trainer accepts any T
   2. Warm start               — optional via `load_state_dict_partial`
   3. Gradient clipping        — `grad_clip_norm` in cfg (default 1.0)
-  4. LayerNorm                — already in ShadowPriceTransformerMulti
+  4. LayerNorm                — already in PostedPriceNetworkMulti heads
   5. Two-stage loss schedule  — `warmup_iters` iters without regret penalty,
                                 then regret λ ramps as `λ_max * (1 - exp(-it/τ))`
   6. Checkpoint every 500 iters with best-regret tracking
@@ -213,9 +213,8 @@ class VPPTrainerMulti:
             torch.ones(self.N, device=self.device) * self.cfg["w_rgt_init"])
         self.w_ir = nn.Parameter(
             torch.ones(self.N, device=self.device) * self.cfg["w_ir_init"])
-        self.update_rate = self.cfg["update_rate"]
         self.opt_lag = torch.optim.SGD(
-            [self.w_rgt, self.w_ir], lr=self.update_rate)
+            [self.w_rgt, self.w_ir], lr=self.cfg["update_rate"])
 
         # Grid-buyback outside option. This is intentionally much lower
         # than the day-ahead purchase price because exporting DER power to

@@ -125,8 +125,6 @@ def metric_row(name: str, net: dict, types: torch.Tensor,
         row["rho_max"] = float(rho.max())
     if price_components is not None:
         for key in ("rho_base", "rho_type",
-                    "rho_security_main", "rho_scarcity_main",
-                    "rho_security_residual", "rho_scarcity_residual",
                     "rho_security", "rho_scarcity", "rho_peer_bid",
                     "rho_unclamped"):
             value = price_components.get(key)
@@ -226,10 +224,6 @@ def evaluate_checkpoint(run_dir: str, ckpt_name: str, args):
     mech = VPPMechanismMulti(
         net,
         posted_price_cfg=dict(
-            price_arch=args.price_arch,
-            transformer_layers=args.transformer_layers,
-            transformer_heads=args.transformer_heads,
-            transformer_dropout=args.transformer_dropout,
             pi_buyback_ratio=args.pi_buyback_ratio,
             use_peer_bid_context=not args.disable_peer_bid_context,
             peer_bid_scale=args.peer_bid_scale,
@@ -288,7 +282,6 @@ def main():
                         help="Run directory. Defaults to latest original/runs/*.")
     parser.add_argument("--checkpoints", nargs="*", default=[
         "model_best_loss.pth", "model_best_constr.pth", "model_best.pth",
-        "model_best_feasible_rent.pth", "model_best_correction.pth",
         "final_model.pth",
     ])
     parser.add_argument("--samples", type=int, default=24)
@@ -296,11 +289,6 @@ def main():
     parser.add_argument("--ctrl-min-ratio", type=float, default=0.15)
     parser.add_argument("--pi-buyback-ratio", type=float, default=0.1)
     parser.add_argument("--peer-bid-scale", type=float, default=0.25)
-    parser.add_argument("--price-arch", default="mlp",
-                        choices=["mlp", "transformer"])
-    parser.add_argument("--transformer-layers", type=int, default=2)
-    parser.add_argument("--transformer-heads", type=int, default=4)
-    parser.add_argument("--transformer-dropout", type=float, default=0.0)
     parser.add_argument("--disable-peer-bid-context", action="store_true",
                         help="Use the old public-context-only posted price.")
     parser.add_argument("--adjustment-weight", type=float, default=1.0)
