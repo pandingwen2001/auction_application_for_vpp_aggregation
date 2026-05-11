@@ -129,6 +129,32 @@ class DC3OPFLayerMulti(nn.Module):
             torch.tensor(net_multi["A_volt_ess"], dtype=torch.float32), persistent=False)               # [n_buses, n_ess]
 
     # ------------------------------------------------------------------
+    # Scenario hot-swap (used by multi-scenario training)
+    # ------------------------------------------------------------------
+
+    def set_scenario(self, net_multi: dict) -> None:
+        """Update only the time-varying profile buffers from a new net_multi.
+
+        Topology (A_flow, A_volt, mt_indices, ESS) is assumed identical
+        across scenarios — only load/price/availability change.
+        """
+        self.net = net_multi
+        self.load_profile.data.copy_(
+            torch.tensor(net_multi["load_profile"], dtype=torch.float32))
+        self.pi_DA_profile.data.copy_(
+            torch.tensor(net_multi["pi_DA_profile"], dtype=torch.float32))
+        self.x_bar_profile.data.copy_(
+            torch.tensor(net_multi["x_bar_profile"], dtype=torch.float32))
+        self.flow_margin_up_profile.data.copy_(
+            torch.tensor(net_multi["flow_margin_up_profile"], dtype=torch.float32))
+        self.flow_margin_dn_profile.data.copy_(
+            torch.tensor(net_multi["flow_margin_dn_profile"], dtype=torch.float32))
+        self.volt_margin_up_profile.data.copy_(
+            torch.tensor(net_multi["volt_margin_up_profile"], dtype=torch.float32))
+        self.volt_margin_dn_profile.data.copy_(
+            torch.tensor(net_multi["volt_margin_dn_profile"], dtype=torch.float32))
+
+    # ------------------------------------------------------------------
     # Forward pass
     # ------------------------------------------------------------------
 

@@ -21,6 +21,13 @@ experiment/*/results/
 *.npz
 *.npy
 
+# Keep the small ERCOT typical-day scenario bundle (regenerable via
+# data/fetch_ercot_typical_days.py but committed for reproducibility)
+!data/ercot_2023_typical.npz
+
+# Raw EIA-930 and gridstatus caches: large, regenerable
+data/_eia_cache/
+
 .ipynb_checkpoints/
 *.log
 tmp/

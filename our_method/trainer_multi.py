@@ -162,13 +162,35 @@ class VPPTrainerMulti:
 
     def __init__(self, mechanism: VPPMechanismMulti,
                  prior: DERTypePriorMulti,
-                 cfg: dict = None, device="cpu", out_dir=None):
+                 cfg: dict = None, device="cpu", out_dir=None,
+                 scenarios: list = None):
+        """
+        Parameters
+        ----------
+        scenarios : list of net_multi dicts, or None
+            If provided, training cycles through these scenarios uniformly at
+            random — each iteration calls `mechanism.set_scenario(...)` so all
+            batches in that iteration share one scenario. If None, classical
+            single-scenario training (Liu profiles).
+        """
         self.cfg = {**self.DEFAULT_CFG, **(cfg or {})}
         self.device = torch.device(device)
         self.mech = mechanism.to(self.device)
         self.prior = prior
         self.N = prior.N
         self.T = mechanism.T
+
+        self.scenarios = scenarios
+        self._multi_scenario = scenarios is not None and len(scenarios) > 1
+        if self._multi_scenario:
+            print(f"  Multi-scenario training enabled: {len(scenarios)} scenarios")
+            # Validate that all scenarios share the same N, T (sanity check)
+            for i, sc in enumerate(scenarios):
+                if sc["n_ders"] != self.N or sc["T"] != self.T:
+                    raise ValueError(
+                        f"Scenario {i}: shape mismatch "
+                        f"(N={sc['n_ders']} T={sc['T']}; "
+                        f"trainer expects N={self.N} T={self.T})")
 
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         if out_dir is None:
@@ -220,20 +242,38 @@ class VPPTrainerMulti:
         # than the day-ahead purchase price because exporting DER power to
         # the grid is uncertain/discounted from the VPP's perspective.
         net_multi = mechanism.net_multi
-        pi_DA_np = np.asarray(net_multi["pi_DA_profile"], dtype=np.float32)
         ratio = float(self.cfg["pi_buyback_ratio"])
-        self.pi_buyback_T = torch.tensor(ratio * pi_DA_np,
-                                          dtype=torch.float32,
-                                          device=self.device)                  # [T]
-        self.x_bar_T_N = torch.tensor(net_multi["x_bar_profile"],
-                                      dtype=torch.float32,
-                                      device=self.device)                      # [T, N]
-        self.load_T = torch.tensor(net_multi["load_profile"],
-                                   dtype=torch.float32,
-                                   device=self.device)                         # [T]
-        self.pi_DA_T = torch.tensor(pi_DA_np, dtype=torch.float32,
-                                    device=self.device)                        # [T]
         self._use_outside = ratio > 0.0
+
+        def _build_scenario_tensors(net_dict):
+            pi_DA_np = np.asarray(net_dict["pi_DA_profile"], dtype=np.float32)
+            return dict(
+                pi_buyback_T = torch.tensor(ratio * pi_DA_np,
+                                            dtype=torch.float32,
+                                            device=self.device),
+                x_bar_T_N    = torch.tensor(net_dict["x_bar_profile"],
+                                            dtype=torch.float32,
+                                            device=self.device),
+                load_T       = torch.tensor(net_dict["load_profile"],
+                                            dtype=torch.float32,
+                                            device=self.device),
+                pi_DA_T      = torch.tensor(pi_DA_np,
+                                            dtype=torch.float32,
+                                            device=self.device),
+            )
+
+        if self._multi_scenario:
+            self._scenario_tensors = [_build_scenario_tensors(sc)
+                                      for sc in self.scenarios]
+            self.current_scenario_idx = 0
+            self._apply_scenario_state(0)
+        else:
+            t = _build_scenario_tensors(net_multi)
+            self.pi_buyback_T = t["pi_buyback_T"]
+            self.x_bar_T_N    = t["x_bar_T_N"]
+            self.load_T       = t["load_T"]
+            self.pi_DA_T      = t["pi_DA_T"]
+            self.current_scenario_idx = None
 
         labels = net_multi.get("der_labels", [f"DER_{i}" for i in range(self.N)])
         der_types = net_multi.get("der_type", ["DER"] * self.N)
@@ -268,12 +308,28 @@ class VPPTrainerMulti:
             "w_rgt_mean", "w_ir_mean",
             "constr_penalty", "lambda_rgt_mult",
             "ess_discharge_total", "ess_charge_total",
+            "scenario_idx",
         ]
         monitor_keys = self._monitor_history_keys()
         self.history = {k: [] for k in base_history_keys + monitor_keys}
         self.best_regret_mean = float("inf")
         self.best_constr_penalty = float("inf")
         self.best_loss = float("inf")
+
+    # ------------------------------------------------------------------
+    # Scenario switching (multi-scenario mode only)
+    # ------------------------------------------------------------------
+
+    def _apply_scenario_state(self, idx: int) -> None:
+        """Point trainer's per-T tensors at the cached scenario tensors and
+        ask the mechanism to swap its data buffers."""
+        t = self._scenario_tensors[idx]
+        self.pi_buyback_T = t["pi_buyback_T"]
+        self.x_bar_T_N    = t["x_bar_T_N"]
+        self.load_T       = t["load_T"]
+        self.pi_DA_T      = t["pi_DA_T"]
+        self.mech.set_scenario(self.scenarios[idx])
+        self.current_scenario_idx = idx
 
     # ------------------------------------------------------------------
     # Monitoring helpers
@@ -637,6 +693,10 @@ class VPPTrainerMulti:
                 t0 = time.time()
                 sel = self.indices[start:start + BS]
 
+                if self._multi_scenario:
+                    scen_idx = int(np.random.randint(len(self.scenarios)))
+                    self._apply_scenario_state(scen_idx)
+
                 types = torch.tensor(self.types_all[sel], device=self.device)
                 adv_var = nn.Parameter(
                     torch.tensor(self.adv_all[:, sel], device=self.device))
@@ -791,6 +851,9 @@ class VPPTrainerMulti:
                     self.history["lambda_rgt_mult"].append(rgt_mult)
                     self.history["ess_discharge_total"].append(ess_d_tot)
                     self.history["ess_charge_total"].append(ess_c_tot)
+                    self.history["scenario_idx"].append(
+                        -1 if self.current_scenario_idx is None
+                        else self.current_scenario_idx)
                     for k, v in diag.items():
                         self.history[k].append(v)
 
@@ -811,6 +874,9 @@ class VPPTrainerMulti:
                             "train/lambda_rgt_mult":   rgt_mult,
                             "train/ess_discharge_MWh": ess_d_tot,
                             "train/ess_charge_MWh":    ess_c_tot,
+                            "train/scenario_idx":      (
+                                -1 if self.current_scenario_idx is None
+                                else self.current_scenario_idx),
                         }
                         wandb_log.update({f"monitor/{k}": v
                                           for k, v in diag.items()})

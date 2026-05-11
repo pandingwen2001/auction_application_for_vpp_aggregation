@@ -53,7 +53,11 @@ except ImportError:
 # Data module
 _DATA_DIR = os.path.join(_THIS_DIR, "..", "data")
 sys.path.insert(0, _DATA_DIR)
-from liu_profiles import load_24h_profiles   # noqa: E402
+from liu_profiles import load_24h_profiles               # noqa: E402
+from ercot_profiles import (                              # noqa: E402
+    load_24h_profiles_ercot, num_scenarios as ercot_num_scenarios,
+    scenario_date as ercot_scenario_date,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -95,18 +99,22 @@ def build_network_multi(base_load_mw: float = None,
                         include_dr: bool = False,
                         pv_scale: float = 4.8,
                         mt_scale: float = 2.0,
-                        ctrl_min_ratio: float = 0.15) -> dict:
+                        ctrl_min_ratio: float = 0.15,
+                        scenario_idx: int = None,
+                        pi_clip_factor: float = 3.0) -> dict:
     """
     Build the 24h multi-period VPP network dict.
 
     Parameters
     ----------
     base_load_mw : float or None
-        If provided, scales the load profile so its PEAK equals this value.
+        If provided, scales the load profile so its PEAK (Liu mode) or
+        24-day-mean (ERCOT mode) equals this value.
     pi_DA_baseline : float or None
         Mean grid price over 24h. If None, uses single-period pi_DA.
     constant_price : bool
-        If True, pi_DA_profile is flat at pi_DA_baseline.
+        If True, pi_DA_profile is flat at pi_DA_baseline.  Only honoured
+        in Liu mode (scenario_idx is None).
     include_dr : bool
         If False (default), DR-type DERs are removed. N = 12 (8 DG + 4 MT).
     pv_scale : float
@@ -117,6 +125,15 @@ def build_network_multi(base_load_mw: float = None,
         Minimum local controllable (MT) generation ratio per timestep (default 0.15).
         Controllable = MT + P_VPP (grid import). Stored in net dict for
         use by OPF layer and baselines.
+    scenario_idx : int or None
+        If provided (0..23), load ERCOT 2023 typical day `scenario_idx`
+        instead of Liu profiles. The 24-day means are calibrated to match
+        Liu's reference values; per-day variation around those means is
+        retained (winter days have lower load and PV; summer days higher).
+    pi_clip_factor : float
+        ERCOT-mode only. Scarcity-event clip threshold expressed as a
+        multiple of pi_DA_baseline.  Default 3.0 caps real ERCOT spikes
+        at ~$120/MWh before mean-rescaling to Liu's $40.98 baseline.
 
     Returns
     -------
@@ -138,11 +155,19 @@ def build_network_multi(base_load_mw: float = None,
     # ------------------------------------------------------------------
     # Time-varying profiles
     # ------------------------------------------------------------------
-    profiles = load_24h_profiles(
-        base_load_mw=base_load_mw,
-        pi_DA_baseline=pi_DA_baseline,
-        constant_price=constant_price,
-    )
+    if scenario_idx is None:
+        profiles = load_24h_profiles(
+            base_load_mw=base_load_mw,
+            pi_DA_baseline=pi_DA_baseline,
+            constant_price=constant_price,
+        )
+    else:
+        profiles = load_24h_profiles_ercot(
+            scenario_idx=scenario_idx,
+            base_load_mw=base_load_mw,
+            pi_DA_baseline=pi_DA_baseline,
+            pi_clip_factor=pi_clip_factor,
+        )
     T              = profiles["T"]
     load_profile   = profiles["load_profile"]       # [T]
     pv_factor      = profiles["pv_factor"]           # [T]
@@ -254,6 +279,8 @@ def build_network_multi(base_load_mw: float = None,
         x_bar                   = x_bar,                 # [N] (scaled PV)
         x_bar_profile           = x_bar_profile,         # [T, N]
         pi_DA_profile           = pi_DA_profile,         # [T]
+        scenario_idx            = profiles.get("scenario_idx"),  # None in Liu mode
+        scenario_date           = profiles.get("scenario_date"), # None in Liu mode
         # Per-timestep network margins
         loads_profile           = loads_profile,         # [T, n_buses]
         baseline_flow_profile   = baseline_flow_profile, # [T, n_lines]

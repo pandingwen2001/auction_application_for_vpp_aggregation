@@ -87,6 +87,27 @@ class MultiPeriodContextBuilder:
         return self.context_static.to(device).unsqueeze(0).expand(
             batch_size, -1, -1, -1)
 
+    def set_scenario(self, net_multi: dict) -> None:
+        """Rebuild context_static from a new net_multi (time-varying data)."""
+        T = net_multi["T"]
+        N = net_multi["n_ders"]
+        x_bar_nom = np.asarray(net_multi["x_bar"], dtype=np.float64) + 1e-9
+        x_bar_prof = np.asarray(net_multi["x_bar_profile"], dtype=np.float64)
+        load_prof  = np.asarray(net_multi["load_profile"], dtype=np.float64)
+        pi_DA_prof = np.asarray(net_multi["pi_DA_profile"], dtype=np.float64)
+        load_max  = max(float(load_prof.max()),  1e-9)
+        pi_DA_max = max(float(pi_DA_prof.max()), 1e-9)
+        ctx = np.zeros((T, N, self.N_CTX_FEATURES), dtype=np.float32)
+        ctx[..., 0] = x_bar_prof / x_bar_nom[None, :]
+        ctx[..., 1] = (load_prof  / load_max)[:, None]
+        ctx[..., 2] = (pi_DA_prof / pi_DA_max)[:, None]
+        hours = np.arange(T)
+        ctx[..., 3] = np.sin(2 * np.pi * hours / T)[:, None]
+        ctx[..., 4] = np.cos(2 * np.pi * hours / T)[:, None]
+        new_ctx = torch.tensor(ctx, dtype=torch.float32,
+                               device=self.context_static.device)
+        self.context_static = new_ctx
+
 
 # ===========================================================================
 # Bid-independent posted-price network
@@ -185,9 +206,13 @@ class PostedPriceNetworkMulti(nn.Module):
         self.peer_bid_feature_dim = len(self.TYPE_ORDER) * 3
 
         pi_DA = np.asarray(net_multi["pi_DA_profile"], dtype=np.float32)
-        floor = float(price_floor_ratio) * pi_DA
+        self._price_floor_ratio = float(price_floor_ratio)
         cap_ratio = np.asarray([type_cap_ratio[t] for t in type_names],
                                dtype=np.float32)
+        self.register_buffer("_cap_ratio_per_type",
+                             torch.tensor(cap_ratio, dtype=torch.float32),
+                             persistent=False)
+        floor = float(price_floor_ratio) * pi_DA
         cap = pi_DA[:, None] * cap_ratio[None, :]
         cap = np.maximum(cap, floor[:, None] + 1e-3)
 
@@ -242,6 +267,20 @@ class PostedPriceNetworkMulti(nn.Module):
             nn.Linear(hidden, 1),
         )
         self._init_weights()
+
+    def set_scenario(self, net_multi: dict) -> None:
+        """Recompute price floor/cap from the new pi_DA_profile.
+
+        Per-type cap ratios and price_floor_ratio are intrinsic to the
+        learned mechanism and unchanged across scenarios.
+        """
+        pi_DA = torch.tensor(net_multi["pi_DA_profile"], dtype=torch.float32,
+                             device=self.price_floor_T.device)
+        floor = self._price_floor_ratio * pi_DA
+        cap = pi_DA.unsqueeze(-1) * self._cap_ratio_per_type.unsqueeze(0)
+        cap = torch.maximum(cap, floor.unsqueeze(-1) + 1e-3)
+        self.price_floor_T.data.copy_(floor)
+        self.price_cap_TN.data.copy_(cap)
 
     def _init_weights(self):
         for m in self.mlp:
@@ -427,6 +466,20 @@ class VPPMechanismMulti(nn.Module):
         self.register_buffer("x_bar_profile",
             torch.tensor(net_multi["x_bar_profile"], dtype=torch.float32),
             persistent=False)
+
+    def set_scenario(self, net_multi: dict) -> None:
+        """Hot-swap the time-varying profile data without resetting any
+        learned parameters. Used by multi-scenario training to switch
+        between the 24 ERCOT typical days each iteration.
+        """
+        self.net_multi = net_multi
+        self.pi_DA_profile.data.copy_(
+            torch.tensor(net_multi["pi_DA_profile"], dtype=torch.float32))
+        self.x_bar_profile.data.copy_(
+            torch.tensor(net_multi["x_bar_profile"], dtype=torch.float32))
+        self.dc3_opf.set_scenario(net_multi)
+        self.context_builder.set_scenario(net_multi)
+        self.posted_price_net.set_scenario(net_multi)
 
     def _accepted_supply_cap(self, bids: torch.Tensor,
                              rho: torch.Tensor) -> torch.Tensor:
