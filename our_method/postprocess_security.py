@@ -51,10 +51,11 @@ class SecurityPostProcessor:
 
     def __init__(self, net_multi: dict, solver: str = None,
                  allow_mt_security_uplift: bool = True,
-                 adjustment_weight: float = 1.0,
+                 adjustment_weight: float = None,
                  settlement_weight: float = 1e-3,
                  mt_slack_weight: float = 1e5,
-                 ess_degrad_cost: float = 5.0):
+                 ess_degrad_cost: float = 5.0,
+                 enable_ess_arbitrage: bool = True):
         if not CVXPY_AVAILABLE:
             raise RuntimeError("cvxpy is required for SecurityPostProcessor")
 
@@ -62,6 +63,17 @@ class SecurityPostProcessor:
         self.T = int(net_multi["T"])
         self.N = int(net_multi["n_ders"])
         self.allow_mt_security_uplift = bool(allow_mt_security_uplift)
+        # When True (default), let P_VPP and ESS be jointly optimised with the
+        # full day-ahead grid cost term so ESS can perform price arbitrage.
+        # When False, fall back to the legacy behaviour that pins P_VPP near
+        # the mechanism's preliminary value (ESS sits idle).
+        self.enable_ess_arbitrage = bool(enable_ess_arbitrage)
+        if adjustment_weight is None:
+            # Arbitrage mode needs a stronger DER anchor (||x - x_pre||²)
+            # because grid_cost (full weight) would otherwise drag DER
+            # dispatch up to displace P_VPP directly. Empirically 1e3 keeps
+            # the per-cell deviation below 0.05 MW while leaving ESS free.
+            adjustment_weight = 1000.0 if enable_ess_arbitrage else 1.0
         self.adjustment_weight = float(adjustment_weight)
         self.settlement_weight = float(settlement_weight)
         self.mt_slack_weight = float(mt_slack_weight)
@@ -135,15 +147,36 @@ class SecurityPostProcessor:
         pvpp_pre = cp.Parameter(T)
         x_cap = cp.Parameter((T, N), nonneg=True)
         rho = cp.Parameter((T, N), nonneg=True)
+        mt_aggr_cap = cp.Parameter(T, nonneg=True)
 
-        adjustment = cp.sum_squares(x - x_pre) + cp.sum_squares(P_VPP - pvpp_pre)
-        settlement = cp.sum(cp.multiply(rho, x)) + self.pi_DA_profile @ P_VPP
         ess_deg = self.ess_degrad_cost * cp.sum(P_c + P_d)
         slack_penalty = self.mt_slack_weight * cp.sum_squares(mt_slack)
 
-        obj = cp.Minimize(self.adjustment_weight * adjustment
-                          + self.settlement_weight * settlement
-                          + ess_deg + slack_penalty)
+        if self.enable_ess_arbitrage:
+            # New objective: keep DER dispatch close to the mechanism's
+            # preliminary x_pre, but let P_VPP and ESS freely arbitrage
+            # against the (public) day-ahead price. No DER cost information
+            # is used.
+            adjustment = cp.sum_squares(x - x_pre)
+            grid_cost = self.pi_DA_profile @ P_VPP
+            obj = cp.Minimize(
+                self.adjustment_weight * adjustment
+                + grid_cost
+                + ess_deg
+                + slack_penalty
+            )
+        else:
+            # Legacy behaviour: pin both x and P_VPP to their pre values.
+            adjustment = (cp.sum_squares(x - x_pre)
+                          + cp.sum_squares(P_VPP - pvpp_pre))
+            settlement = (cp.sum(cp.multiply(rho, x))
+                          + self.pi_DA_profile @ P_VPP)
+            obj = cp.Minimize(
+                self.adjustment_weight * adjustment
+                + self.settlement_weight * settlement
+                + ess_deg
+                + slack_penalty
+            )
 
         cons = []
         dual_cons = {
@@ -191,6 +224,12 @@ class SecurityPostProcessor:
             cons.append(c)
             dual_cons["mt_floor"].append(c)
 
+            # Aggregate MT cap: MTs cannot exceed max(offer_sum, floor).
+            # Prevents the grid-cost objective from over-dispatching MTs
+            # beyond what security requires.
+            c = cp.sum(x[t, self.mt_indices]) <= mt_aggr_cap[t]
+            cons.append(c)
+
             c = P_c[t, :] <= self.ess_pmax
             cons.append(c)
             dual_cons["ess_charge_cap"].append(c)
@@ -218,15 +257,39 @@ class SecurityPostProcessor:
         self._pvpp_pre = pvpp_pre
         self._x_cap = x_cap
         self._rho = rho
+        self._mt_aggr_cap = mt_aggr_cap
         self._dual_cons = dual_cons
         self._prob = cp.Problem(obj, cons)
 
     def _effective_cap(self, offer_cap: np.ndarray) -> np.ndarray:
+        """Per-DER per-hour upper bound used by the QP.
+
+        Non-MT DERs are always capped at their accepted offer cap (preserves
+        IR / IC, since the mechanism's rho was learned against these caps).
+        MT DERs are individually allowed up to their physical availability,
+        but an extra aggregate constraint in ``_build_problem`` caps the
+        sum of MT dispatch at ``max(floor, sum(offer_cap_MT))`` so the
+        ESS-arbitrage objective cannot over-dispatch MTs beyond what
+        security requires.
+        """
         cap = np.minimum(np.maximum(offer_cap, 0.0), self.x_bar_profile)
-        if self.allow_mt_security_uplift:
-            cap = cap.copy()
-            cap[:, self.mt_indices] = self.x_bar_profile[:, self.mt_indices]
+        if not self.allow_mt_security_uplift:
+            return cap
+        cap = cap.copy()
+        cap[:, self.mt_indices] = self.x_bar_profile[:, self.mt_indices]
         return cap
+
+    def _mt_aggregate_cap(self, offer_cap: np.ndarray) -> np.ndarray:
+        """Per-hour cap on the *sum* of MT dispatch.
+
+        The QP can lift MTs up to their offer cap freely, and additionally
+        up to whatever is needed to satisfy the local controllable floor.
+        It cannot lift them higher than that just to displace P_VPP.
+        """
+        offer_cap = np.maximum(np.asarray(offer_cap, dtype=np.float64), 0.0)
+        mt_offer_sum_t = offer_cap[:, self.mt_indices].sum(axis=1)
+        floor_t = self.ctrl_min_ratio * self.load_profile
+        return np.maximum(mt_offer_sum_t, floor_t)
 
     def _dual_specs(self) -> dict:
         return {
@@ -368,6 +431,7 @@ class SecurityPostProcessor:
         self._pvpp_pre.value = P_VPP_pre
         self._rho.value = np.maximum(rho, 0.0)
         self._x_cap.value = cap
+        self._mt_aggr_cap.value = self._mt_aggregate_cap(offer_cap)
 
         try:
             self._prob.solve(solver=self.solver, warm_start=True)
