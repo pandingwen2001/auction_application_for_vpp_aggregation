@@ -1,57 +1,69 @@
-# Experiment 4: Strategic Behavior Stress Test
+# Experiment 4: ERCOT Strategic Behavior
 
-This experiment evaluates unilateral strategic behavior. For each DER, the
-script changes only that DER's reported cost parameters while utility is always
+This is the main strategic-behavior experiment. For each DER, the script
+changes only that DER's reported cost parameters while utility is always
 computed using the true type.
+
+Two attack classes are reported:
+
+- `fixed`: cost inflation, cost shading, and upper/lower-bound bid proxies.
+- `optimal_spsa`: projected black-box GD/SPSA best response over sampled bid
+  reports, using 25-50 iterations.
 
 ## Run
 
 ```powershell
-cd C:\tcxp\2026_spring\posted_price_VPP
-python experiment\04_strategic_behavior\run_strategic_behavior.py --samples 12
+cd C:\tcxp\2026_spring\auction_application_for_vpp_aggregation
+python experiment\04_strategic_behavior\run_strategic_behavior.py --scenario-idx 0 --samples 6 --gd-steps 30 --checkpoint model_best.pth --out-dir experiment\04_strategic_behavior\results_ercot_paper
 ```
 
-Fast smoke test:
+Faster smoke test:
 
 ```powershell
-python experiment\04_strategic_behavior\run_strategic_behavior.py --samples 2 --overreport-scales 1.25 --underreport-scales 0.8
+python experiment\04_strategic_behavior\run_strategic_behavior.py --scenario-idx 0 --samples 2 --gd-steps 3 --methods ours_posted_price,bid_dependent_opf_pay_as_bid,bid_dependent_opf_uniform_da --spsa-methods ours_posted_price --out-dir experiment\04_strategic_behavior\results_smoke
+```
+
+To run a broader ERCOT subset:
+
+```powershell
+python experiment\04_strategic_behavior\run_strategic_behavior.py --all-ercot-scenarios --max-scenarios 6 --samples 4 --gd-steps 25 --checkpoint model_best.pth --out-dir experiment\04_strategic_behavior\results_ercot_subset
 ```
 
 ## Compared Methods
 
-- `learned_peer_posted_price`: proposed own-bid-excluded peer-context posted price.
-- `learned_public_only_posted_price`: public-context-only posted price baseline.
-- `bid_dependent_opf_pay_as_bid`: bid-dependent OPF with pay-as-bid settlement.
-- `bid_dependent_opf_uniform_da`: bid-dependent OPF with uniform day-ahead-price settlement.
+The fixed-strategy grid uses the same method set as the main overall
+performance experiment:
 
-## Strategy Candidates
+- `ours_posted_price`
+- `vcg_disaggregation`
+- `shapley_value_disaggregation`
+- `nucleolus_disaggregation`
+- `dlmp_settlement`
+- `bid_dependent_opf_pay_as_bid`
+- `bid_dependent_opf_uniform_da`
+- `constrained_social_opt`
 
-- `cost_overreport`: multiply both quadratic and linear cost parameters.
-- `linear_cost_overreport`: multiply only the linear term.
-- `cost_underreport`: reduce both cost parameters.
-- `high_cost_withholding_proxy`: set the DER's bid to its upper bound. In the
-  current model, physical availability is public, so this is a cost-bid proxy
-  for economic capacity withholding.
-- `low_cost_quantity_pressure`: set the DER's bid to its lower bound.
+By default, projected SPSA is run for `ours_posted_price`, `dlmp_settlement`,
+`bid_dependent_opf_pay_as_bid`, and `bid_dependent_opf_uniform_da`. Add
+`--include-cooperative-spsa` to also run it for VCG/Shapley/Nucleolus; this is
+much slower because coalition values must be recomputed repeatedly.
 
 ## Outputs
 
-- `results/strategic_behavior_detailed.csv`: per-method, per-DER, per-strategy,
-  per-stage utility gains and system deltas.
-- `results/strategic_behavior_summary.csv`: aggregate by method, strategy, and stage.
-- `results/best_response_by_der.csv`: best strategy among the candidate set for
-  each DER.
-- `results/best_response_summary.csv`: headline regret statistics by method and stage.
-- `results/best_response_summary.md`: Markdown version of the headline best-response summary.
-- `results/strategic_behavior_config.json`: run settings and strategy grid.
+- `strategic_behavior_detailed.csv`: per-method, per-DER, per-strategy utility
+  gains and system deltas.
+- `best_response_by_der.csv`: best attack for each DER.
+- `best_response_summary.csv`: headline regret statistics by method and attack
+  type.
+- `best_response_summary.md`: Markdown version of the headline table.
+- `strategic_behavior_config.json`: run settings and attack grid.
 
 ## Key Diagnostics
 
-- `regret_mean`: mean positive utility gain from the candidate misreport.
-- `own_rho_delta_max`: should be near zero for the proposed posted-price method.
-- `other_rho_delta_mean`: may be nonzero when peer-bid context is enabled.
-- `procurement_delta`, `info_rent_delta`, `positive_adjustment_delta`: system
-  consequences of the unilateral deviation.
-
-Important wording for the paper: this is evidence of reduced individual price
-manipulation channels, not a formal proof of full strategy-proofness.
+- `regret_mean_across_der`: average positive utility gain from misreporting.
+- `regret_max_der`: worst DER-level mean regret.
+- `regret_max_sample`: worst single-sample utility gain.
+- `own_rho_delta_max`: should be near zero for the proposed own-bid-excluded
+  posted-price mechanism.
+- `procurement_delta_at_worst` and `info_rent_delta_at_worst`: system impact
+  at the worst strategic deviation.

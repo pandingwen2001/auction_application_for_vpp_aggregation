@@ -1,23 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Experiment 3: Ablation Study
-----------------------------
-Evaluate which parts of the posted-price mechanism matter.
+Experiment 3: ERCOT Ablation Study
+----------------------------------
+Evaluate which posted-price components matter on ERCOT typical-day scenarios.
 
-This script performs evaluation-time component ablations on a trained
-checkpoint and optional checkpoint-selection comparisons:
-
-  - full learned mechanism
-  - public-context-only price rule
-  - remove peer-bid component
-  - base + type only
-  - remove security component
-  - remove scarcity component
-  - remove residual dual-guided heads
-  - compare selector/extra checkpoints when available
-
-All rows use the same sampled DER types and security postprocess settings.
+The main table uses postprocessed rows only, plus the constrained social
+optimum reference. Component removal is evaluation-time ablation on the same
+trained checkpoint.
 """
 
 import argparse
@@ -25,6 +15,7 @@ import csv
 import json
 import os
 import sys
+from collections import Counter
 
 import numpy as np
 import torch
@@ -32,10 +23,12 @@ import torch
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.abspath(os.path.join(_THIS_DIR, "..", ".."))
 sys.path.insert(0, _ROOT)
+sys.path.insert(0, os.path.join(_ROOT, "data"))
 sys.path.insert(0, os.path.join(_ROOT, "network"))
 sys.path.insert(0, os.path.join(_ROOT, "our_method"))
 
 from baseline.baseline_social_opt_multi import SocialOptimumMechanismMulti  # noqa: E402
+from data.ercot_profiles import num_scenarios as ercot_num_scenarios  # noqa: E402
 from network.vpp_network_multi import build_network_multi  # noqa: E402
 from our_method.evaluate_posted_price import (  # noqa: E402
     TYPE_CAP_RATIO,
@@ -52,20 +45,32 @@ from our_method.vpp_mechanism_multi import VPPMechanismMulti  # noqa: E402
 PAPER_COLUMNS = [
     "ablation_id",
     "ablation_name",
-    "name",
     "paper_role",
     "checkpoint",
     "use_peer_bid_context",
-    "procurement_cost",
-    "social_cost_true",
-    "info_rent",
-    "utility_min",
+    "operation_cost",
+    "info_rent_cost",
+    "total_procurement_cost",
+    "operation_cost_gap_pct",
+    "dispatch_l1_gap_mwh",
+    "der_energy_mwh",
+    "renewable_share_pct",
+    "grid_import_mwh",
+    "feasible_rate_pct",
     "mt_offer_gap_mwh",
     "mt_floor_gap_mwh",
     "postprocess_mt_slack_mwh",
     "positive_adjustment_mwh",
     "positive_adjustment_payment",
-    "dispatch_l1_gap_mwh",
+    "utility_min",
+    "utility_shortfall_cost",
+    "utility_mean",
+    "rho_mean",
+    "rho_base_mean",
+    "rho_type_mean",
+    "rho_security_mean",
+    "rho_scarcity_mean",
+    "rho_peer_bid_mean",
     "postprocess_status",
 ]
 
@@ -85,7 +90,7 @@ ABLATIONS = [
         paper_role="remove_peer_bid_context",
         use_peer_bid_context=False,
         component_scale={},
-        description="Instantiate the learned price rule without peer-bid context.",
+        description="Instantiate the price rule without peer-bid context.",
     ),
     dict(
         ablation_id="A2",
@@ -93,54 +98,31 @@ ABLATIONS = [
         paper_role="remove_peer_bid_component",
         use_peer_bid_context=True,
         component_scale={"peer_bid": 0.0},
-        description="Keep architecture but zero the peer-bid price component.",
+        description="Keep peer architecture but zero the peer-bid price component.",
     ),
     dict(
         ablation_id="A3",
-        ablation_name="base_type_only",
-        paper_role="remove_security_scarcity_peer",
-        use_peer_bid_context=True,
-        component_scale={
-            "security_main": 0.0,
-            "scarcity_main": 0.0,
-            "security_residual": 0.0,
-            "scarcity_residual": 0.0,
-            "peer_bid": 0.0,
-        },
-        description="Only base and type/context components remain.",
-    ),
-    dict(
-        ablation_id="A4",
         ablation_name="no_security_component",
         paper_role="remove_security",
         use_peer_bid_context=True,
-        component_scale={
-            "security_main": 0.0,
-            "security_residual": 0.0,
-        },
+        component_scale={"security": 0.0},
         description="Remove network/security price adders.",
     ),
     dict(
-        ablation_id="A5",
+        ablation_id="A4",
         ablation_name="no_scarcity_component",
         paper_role="remove_scarcity",
         use_peer_bid_context=True,
-        component_scale={
-            "scarcity_main": 0.0,
-            "scarcity_residual": 0.0,
-        },
+        component_scale={"scarcity": 0.0},
         description="Remove controllable-resource scarcity price adders.",
     ),
     dict(
-        ablation_id="A6",
-        ablation_name="no_residual_heads",
-        paper_role="remove_dual_guided_residual",
+        ablation_id="A5",
+        ablation_name="base_type_only",
+        paper_role="remove_security_scarcity_peer",
         use_peer_bid_context=True,
-        component_scale={
-            "security_residual": 0.0,
-            "scarcity_residual": 0.0,
-        },
-        description="Remove postprocess-dual residual heads, if trained.",
+        component_scale={"security": 0.0, "scarcity": 0.0, "peer_bid": 0.0},
+        description="Only base and type/context components remain.",
     ),
 ]
 
@@ -187,6 +169,54 @@ def apply_component_scale(mech: VPPMechanismMulti, scale: dict):
         pp.set_component_scale(**scale)
 
 
+def feasible_rate_from_status(status: str) -> float:
+    status = str(status or "").strip()
+    if status in {"", "not_applicable", "oracle_qp"}:
+        return 100.0
+    good = 0.0
+    total = 0.0
+    for item in status.split(";"):
+        if not item:
+            continue
+        if ":" in item:
+            label, count = item.rsplit(":", 1)
+            try:
+                count = float(count)
+            except ValueError:
+                count = 1.0
+        else:
+            label, count = item, 1.0
+        total += count
+        if label.strip().lower() in {"optimal", "optimal_inaccurate"}:
+            good += count
+    return 100.0 * good / max(total, 1.0)
+
+
+def add_table_metrics(row: dict, social_ref_cost: float = None) -> dict:
+    out = dict(row)
+    operation_cost = float(out.get("social_cost_true", 0.0) or 0.0)
+    info_rent = float(out.get("info_rent", 0.0) or 0.0)
+    total = float(out.get("procurement_cost", operation_cost + info_rent) or 0.0)
+    out["operation_cost"] = operation_cost
+    out["info_rent_cost"] = info_rent
+    out["total_procurement_cost"] = total
+    if social_ref_cost is not None and social_ref_cost > 1e-9:
+        out["operation_cost_gap_pct"] = (
+            100.0 * (operation_cost - social_ref_cost) / social_ref_cost)
+    else:
+        out["operation_cost_gap_pct"] = 0.0
+    pv = float(out.get("PV_energy_mwh", 0.0) or 0.0)
+    wt = float(out.get("WT_energy_mwh", 0.0) or 0.0)
+    der = float(out.get("der_energy_mwh", 0.0) or 0.0)
+    out["renewable_energy_mwh"] = pv + wt
+    out["renewable_share_pct"] = 100.0 * (pv + wt) / max(der, 1e-9)
+    out["feasible_rate_pct"] = feasible_rate_from_status(
+        out.get("postprocess_status", ""))
+    out["utility_shortfall_cost"] = max(
+        0.0, -float(out.get("utility_min", 0.0) or 0.0))
+    return out
+
+
 def add_metadata(row: dict, spec: dict, stage: str,
                  checkpoint: str, run_dir: str) -> dict:
     out = dict(row)
@@ -231,36 +261,38 @@ def evaluate_spec(spec: dict, net: dict, types: torch.Tensor,
     P_post = torch.tensor(post.P_VPP, dtype=torch.float32)
     p_post = (rho * x_post).sum(dim=1)
 
-    pre_row = metric_row(
-        f"{spec['ablation_name']}:{checkpoint}:pre",
-        net,
-        types,
-        x_pre,
-        p_pre,
-        P_pre,
-        rho=rho,
-        offer_cap=offer_cap,
-        x_social=x_social,
-        source_types=source_types,
-        price_components=price_components,
-    )
-    post_row = metric_row(
-        f"{spec['ablation_name']}:{checkpoint}:post",
-        net,
-        types,
-        x_post,
-        p_post,
-        P_post,
-        rho=rho,
-        offer_cap=offer_cap,
-        post_result=post,
-        x_social=x_social,
-        source_types=source_types,
-        price_components=price_components,
-    )
+    rows = [
+        metric_row(
+            f"{spec['ablation_name']}:{checkpoint}:pre",
+            net,
+            types,
+            x_pre,
+            p_pre,
+            P_pre,
+            rho=rho,
+            offer_cap=offer_cap,
+            x_social=x_social,
+            source_types=source_types,
+            price_components=price_components,
+        ),
+        metric_row(
+            f"{spec['ablation_name']}:{checkpoint}:post",
+            net,
+            types,
+            x_post,
+            p_post,
+            P_post,
+            rho=rho,
+            offer_cap=offer_cap,
+            post_result=post,
+            x_social=x_social,
+            source_types=source_types,
+            price_components=price_components,
+        ),
+    ]
     return [
-        add_metadata(pre_row, spec, "pre", checkpoint, run_dir),
-        add_metadata(post_row, spec, "post", checkpoint, run_dir),
+        add_metadata(rows[0], spec, "pre", checkpoint, run_dir),
+        add_metadata(rows[1], spec, "post", checkpoint, run_dir),
     ]
 
 
@@ -291,9 +323,8 @@ def social_row(net: dict, types: torch.Tensor, x_social: torch.Tensor,
 
 
 def selector_specs(extra_checkpoints: list) -> list:
-    specs = []
-    for ckpt in extra_checkpoints:
-        specs.append(dict(
+    return [
+        dict(
             ablation_id="S",
             ablation_name=f"selector_full_{ckpt}",
             paper_role="checkpoint_selector_comparison",
@@ -301,8 +332,9 @@ def selector_specs(extra_checkpoints: list) -> list:
             component_scale={},
             description="Full model evaluated at an alternative selected checkpoint.",
             checkpoint_override=ckpt,
-        ))
-    return specs
+        )
+        for ckpt in extra_checkpoints
+    ]
 
 
 def write_csv(path: str, rows: list):
@@ -344,28 +376,101 @@ def write_markdown_table(path: str, rows: list):
 
 
 def select_table_rows(rows: list) -> list:
-    out = []
+    return [row for row in rows if row.get("stage") in {"post", "feasible"}]
+
+
+def _as_float(value):
+    try:
+        if value in ("", None):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def merge_statuses(statuses: list) -> str:
+    counts = Counter()
+    passthrough = []
+    for status in statuses:
+        if not status:
+            continue
+        for item in str(status).split(";"):
+            if not item:
+                continue
+            if ":" not in item:
+                passthrough.append(item)
+                continue
+            label, count = item.rsplit(":", 1)
+            try:
+                counts[label] += int(float(count))
+            except ValueError:
+                passthrough.append(item)
+    parts = [f"{k}:{v}" for k, v in sorted(counts.items())]
+    parts.extend(sorted(set(passthrough)))
+    return ";".join(parts)
+
+
+def aggregate_rows(rows: list) -> list:
+    grouped = {}
+    key_cols = ("ablation_id", "ablation_name", "paper_role", "stage", "checkpoint")
     for row in rows:
-        if row.get("stage") in {"post", "feasible"}:
-            out.append(row)
+        key = tuple(row.get(col, "") for col in key_cols)
+        grouped.setdefault(key, []).append(row)
+
+    max_cols = {
+        "utility_shortfall_cost",
+        "mt_floor_gap_max",
+        "mt_floor_gap_mwh",
+        "postprocess_mt_slack_mwh",
+    }
+    min_cols = {"utility_min", "feasible_rate_pct"}
+
+    out = []
+    for _key, group in grouped.items():
+        merged = dict(group[0])
+        all_cols = sorted({k for row in group for k in row})
+        for col in all_cols:
+            vals = [row.get(col, "") for row in group]
+            nums = [_as_float(v) for v in vals]
+            if col in {"scenario_idx", "scenario_date"}:
+                merged[col] = "multiple" if len(group) > 1 else vals[0]
+            elif col == "postprocess_status":
+                merged[col] = merge_statuses(vals)
+            elif all(v is not None for v in nums):
+                if col in max_cols:
+                    merged[col] = float(np.max(nums))
+                elif col in min_cols:
+                    merged[col] = float(np.min(nums))
+                else:
+                    merged[col] = float(np.mean(nums))
+            elif len({str(v) for v in vals}) == 1:
+                merged[col] = vals[0]
+            else:
+                merged[col] = vals[0]
+        merged["n_eval_rows"] = len(group)
+        out.append(merged)
     return out
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--run", default=None,
-                        help="Run directory. Defaults to latest run containing the base checkpoint.")
-    parser.add_argument("--checkpoint", default="model_best_constr.pth",
+                        help="Run directory. Defaults to latest run containing the checkpoint.")
+    parser.add_argument("--checkpoint", default="model_best.pth",
                         help="Main checkpoint used for component ablations.")
     parser.add_argument("--extra-checkpoints", nargs="*", default=[
+        "model_best_constr.pth",
         "model_best_loss.pth",
-        "model_best.pth",
         "model_best_feasible_rent.pth",
         "model_best_correction.pth",
         "final_model.pth",
-    ], help="Optional full-model checkpoint selector comparisons.")
+    ])
+    parser.add_argument("--include-selector-comparison", action="store_true")
     parser.add_argument("--samples", type=int, default=24)
     parser.add_argument("--seed", type=int, default=20260426)
+    parser.add_argument("--scenario-idx", type=int, default=0)
+    parser.add_argument("--all-ercot-scenarios", action="store_true")
+    parser.add_argument("--pi-clip-factor", type=float, default=3.0)
     parser.add_argument("--ctrl-min-ratio", type=float, default=0.15)
     parser.add_argument("--pi-buyback-ratio", type=float, default=0.1)
     parser.add_argument("--peer-bid-scale", type=float, default=0.25)
@@ -374,28 +479,31 @@ def parse_args():
     parser.add_argument("--transformer-layers", type=int, default=2)
     parser.add_argument("--transformer-heads", type=int, default=4)
     parser.add_argument("--transformer-dropout", type=float, default=0.0)
-    parser.add_argument("--skip-selector-comparison", action="store_true")
-    parser.add_argument("--adjustment-weight", type=float, default=1.0)
+    parser.add_argument("--adjustment-weight", type=float, default=1000.0)
     parser.add_argument("--settlement-weight", type=float, default=1e-3)
-    parser.add_argument("--mt-slack-weight", type=float, default=1e5)
+    parser.add_argument("--mt-slack-weight", type=float, default=1e7)
     parser.add_argument("--out-dir", default=None)
     return parser.parse_args()
 
 
-def main():
-    args = parse_args()
-    checkpoints_for_run = [args.checkpoint] + list(args.extra_checkpoints)
-    run_dir = (os.path.abspath(args.run) if args.run
-               else default_run_for_checkpoints(_ROOT, checkpoints_for_run))
-    out_dir = args.out_dir or os.path.join(_THIS_DIR, "results")
-    os.makedirs(out_dir, exist_ok=True)
+def scenario_indices(args):
+    if args.all_ercot_scenarios:
+        return list(range(ercot_num_scenarios()))
+    return [args.scenario_idx]
 
-    net = build_network_multi(
-        constant_price=False,
+
+def build_eval_network(args, scenario_idx: int):
+    return build_network_multi(
+        scenario_idx=int(scenario_idx),
         ctrl_min_ratio=args.ctrl_min_ratio,
+        pi_clip_factor=args.pi_clip_factor,
     )
+
+
+def evaluate_one_scenario(args, run_dir: str, scenario_idx: int) -> list:
+    net = build_eval_network(args, scenario_idx)
     prior = DERTypePriorMulti(net)
-    torch.manual_seed(args.seed)
+    torch.manual_seed(args.seed + int(scenario_idx))
     types = prior.sample(args.samples, device="cpu")
     source_types = classify_sources(net)
 
@@ -413,9 +521,7 @@ def main():
     with torch.no_grad():
         x_soc, _, p_soc, P_soc = social(types)
 
-    rows = [
-        social_row(net, types, x_soc, p_soc, P_soc, source_types)
-    ]
+    rows = [social_row(net, types, x_soc, p_soc, P_soc, source_types)]
 
     base_path = os.path.join(run_dir, args.checkpoint)
     if not os.path.exists(base_path):
@@ -427,7 +533,7 @@ def main():
             spec, net, types, x_soc, source_types,
             postprocessor, run_dir, args.checkpoint, args))
 
-    if not args.skip_selector_comparison:
+    if args.include_selector_comparison:
         seen = {args.checkpoint}
         for spec in selector_specs(args.extra_checkpoints):
             ckpt = spec["checkpoint_override"]
@@ -442,11 +548,35 @@ def main():
                 spec, net, types, x_soc, source_types,
                 postprocessor, run_dir, ckpt, args))
 
+    social_ref_cost = rows[0]["social_cost_true"]
+    for row in rows:
+        row["data_source"] = "ercot"
+        row["scenario_idx"] = int(scenario_idx)
+        row["scenario_date"] = str(net.get("scenario_date", ""))
+    return [add_table_metrics(row, social_ref_cost) for row in rows]
+
+
+def main():
+    args = parse_args()
+    checkpoints_for_run = [args.checkpoint] + list(args.extra_checkpoints)
+    run_dir = (os.path.abspath(args.run) if args.run
+               else default_run_for_checkpoints(_ROOT, checkpoints_for_run))
+    out_dir = args.out_dir or os.path.join(_THIS_DIR, "results_ercot")
+    os.makedirs(out_dir, exist_ok=True)
+
+    rows = []
+    for sc in scenario_indices(args):
+        print("\n" + "=" * 80)
+        print(f"Experiment 3 setting: ERCOT scenario {sc}")
+        print("=" * 80)
+        rows.extend(evaluate_one_scenario(args, run_dir, sc))
+
     detailed_path = os.path.join(out_dir, "ablation_detailed.csv")
-    table_rows = select_table_rows(rows)
+    table_rows = aggregate_rows(select_table_rows(rows))
     table_csv_path = os.path.join(out_dir, "ablation_table.csv")
     table_md_path = os.path.join(out_dir, "ablation_table.md")
     config_path = os.path.join(out_dir, "ablation_config.json")
+
     write_csv(detailed_path, rows)
     write_csv(table_csv_path, table_rows)
     write_markdown_table(table_md_path, table_rows)
@@ -454,6 +584,7 @@ def main():
         config = vars(args).copy()
         config["run_dir"] = run_dir
         config["root"] = _ROOT
+        config["data_source"] = "ercot"
         config["available_ablations"] = ABLATIONS
         json.dump(config, f, indent=2)
 
@@ -464,12 +595,12 @@ def main():
     print("\nAblation headline rows:")
     for row in table_rows:
         print(
-            f"  {row['ablation_id']:<3} {row['ablation_name']:<30} "
-            f"cost={fmt_value(row.get('procurement_cost')):<10} "
-            f"rent={fmt_value(row.get('info_rent')):<10} "
-            f"offer_gap={fmt_value(row.get('mt_offer_gap_mwh')):<10} "
+            f"  {row['ablation_id']:<3} {row['ablation_name']:<26} "
+            f"total={fmt_value(row.get('total_procurement_cost')):<10} "
+            f"opgap={fmt_value(row.get('operation_cost_gap_pct')):<8} "
+            f"rent={fmt_value(row.get('info_rent_cost')):<10} "
             f"corr={fmt_value(row.get('positive_adjustment_mwh')):<10} "
-            f"MTgap={fmt_value(row.get('mt_floor_gap_mwh'))}"
+            f"util_short={fmt_value(row.get('utility_shortfall_cost'))}"
         )
 
 

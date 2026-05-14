@@ -266,7 +266,37 @@ class PostedPriceNetworkMulti(nn.Module):
             nn.LayerNorm(hidden),
             nn.Linear(hidden, 1),
         )
+        self._component_scale = {}
         self._init_weights()
+
+    def reset_component_scale(self) -> None:
+        """Restore all price components to their learned scale."""
+        self._component_scale = {}
+
+    def set_component_scale(self, **scale: float) -> None:
+        """
+        Evaluation-time ablation hook.
+
+        Accepted keys are base, type, security, scarcity, and peer_bid.
+        Missing keys keep scale 1.0.
+        """
+        aliases = {
+            "rho_base": "base",
+            "rho_type": "type",
+            "rho_security": "security",
+            "rho_scarcity": "scarcity",
+            "rho_peer_bid": "peer_bid",
+        }
+        out = {}
+        for key, value in scale.items():
+            key = aliases.get(key, key)
+            if key not in {"base", "type", "security", "scarcity", "peer_bid"}:
+                continue
+            out[key] = float(value)
+        self._component_scale.update(out)
+
+    def _scale_component(self, name: str, value: torch.Tensor) -> torch.Tensor:
+        return float(self._component_scale.get(name, 1.0)) * value
 
     def set_scenario(self, net_multi: dict) -> None:
         """Recompute price floor/cap from the new pi_DA_profile.
@@ -375,14 +405,18 @@ class PostedPriceNetworkMulti(nn.Module):
         system_features = context[:, :, 0, list(self.system_feature_idx)]
         base_gate_delta = torch.tanh(self.base_mlp(system_features).squeeze(-1))
         rho_base = floor.expand(B, T, N) + span * base_gate_delta.unsqueeze(-1)
+        rho_base = self._scale_component("base", rho_base)
 
         # Type/context adder.
         type_raw = self.mlp(features).squeeze(-1)
         type_raw = type_raw + self.type_offset[self.type_ids].view(1, 1, N)
         rho_type = span * torch.sigmoid(type_raw)
+        rho_type = self._scale_component("type", rho_type)
 
         rho_security = span * torch.tanh(self.security_mlp(features).squeeze(-1))
         rho_scarcity = span * torch.tanh(self.scarcity_mlp(features).squeeze(-1))
+        rho_security = self._scale_component("security", rho_security)
+        rho_scarcity = self._scale_component("scarcity", rho_scarcity)
 
         if self.use_peer_bid_context:
             if bids is None:
@@ -394,6 +428,7 @@ class PostedPriceNetworkMulti(nn.Module):
                 self.peer_bid_mlp(peer_features).squeeze(-1)))
         else:
             rho_peer_bid = torch.zeros_like(rho_type)
+        rho_peer_bid = self._scale_component("peer_bid", rho_peer_bid)
 
         rho_unclamped = rho_base + rho_type + rho_security + rho_scarcity + rho_peer_bid
         rho = torch.max(torch.min(rho_unclamped, cap), floor)

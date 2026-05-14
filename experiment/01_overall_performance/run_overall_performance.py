@@ -6,7 +6,8 @@ Experiment 1: Overall Performance
 Build the headline comparison table for the posted-price VPP paper.
 
 Rows include:
-  - fixed posted-price baselines
+  - cooperative disaggregation baselines (VCG, Shapley, nucleolus)
+  - DLMP settlement baseline
   - bid-dependent OPF settlement baselines
   - learned posted-price checkpoints, with and without peer-bid context
   - constrained social optimum oracle
@@ -31,6 +32,7 @@ sys.path.insert(0, _ROOT)
 sys.path.insert(0, os.path.join(_ROOT, "network"))
 sys.path.insert(0, os.path.join(_ROOT, "our_method"))
 
+from baseline.cooperative_disaggregation_multi import cooperative_payoffs  # noqa: E402
 from baseline.baseline_common_multi import JointQPMulti, true_cost_total  # noqa: E402
 from baseline.baseline_social_opt_multi import SocialOptimumMechanismMulti  # noqa: E402
 from network.opf_layer_multi import DC3OPFLayerMulti  # noqa: E402
@@ -46,22 +48,30 @@ from our_method.postprocess_security import SecurityPostProcessor  # noqa: E402
 from our_method.trainer_multi import DERTypePriorMulti  # noqa: E402
 from our_method.vpp_mechanism_multi import VPPMechanismMulti  # noqa: E402
 
+try:
+    from data.ercot_profiles import num_scenarios as ercot_num_scenarios  # noqa: E402
+except Exception:  # pragma: no cover - Liu-only fallback
+    ercot_num_scenarios = None
+
 
 PAPER_COLUMNS = [
     "name",
     "category",
     "settlement",
-    "procurement_cost",
-    "social_cost_true",
-    "info_rent",
-    "utility_min",
-    "mt_floor_gap_mwh",
-    "postprocess_mt_slack_mwh",
-    "mt_offer_gap_mwh",
-    "positive_adjustment_mwh",
-    "positive_adjustment_payment",
+    "operation_cost",
+    "info_rent_cost",
+    "total_procurement_cost",
+    "operation_cost_gap_pct",
     "dispatch_l1_gap_mwh",
-    "postprocess_status",
+    "der_energy_mwh",
+    "renewable_energy_mwh",
+    "renewable_share_pct",
+    "grid_import_mwh",
+    "utility_min",
+    "utility_shortfall_cost",
+    "utility_mean",
+    "feasible_rate_pct",
+    "feasible_status",
 ]
 
 
@@ -188,6 +198,61 @@ def add_metadata(row: dict, category: str, settlement: str,
     return out
 
 
+def feasible_rate_from_status(status: str) -> float:
+    """Convert solver/postprocess status counters into a paper-table rate."""
+    status = str(status or "").strip()
+    if status in {"", "not_applicable"}:
+        return 100.0
+
+    good = 0.0
+    total = 0.0
+    for item in status.split(";"):
+        if not item:
+            continue
+        if ":" in item:
+            label, count = item.rsplit(":", 1)
+            try:
+                count = float(count)
+            except ValueError:
+                count = 1.0
+        else:
+            label, count = item, 1.0
+        label = label.strip().lower()
+        total += count
+        if label in {"optimal", "optimal_inaccurate"}:
+            good += count
+    return 100.0 * good / max(total, 1.0)
+
+
+def add_table_metrics(row: dict, social_ref_cost: float = None) -> dict:
+    """Add paper-facing aliases and efficiency/safety metrics."""
+    out = dict(row)
+    operation_cost = float(out.get("social_cost_true", 0.0))
+    info_rent = float(out.get("info_rent", 0.0))
+    total_procurement = float(out.get("procurement_cost",
+                                      operation_cost + info_rent))
+    out["operation_cost"] = operation_cost
+    out["info_rent_cost"] = info_rent
+    out["total_procurement_cost"] = total_procurement
+    if social_ref_cost is not None and social_ref_cost > 1e-9:
+        out["operation_cost_gap_pct"] = (
+            100.0 * (operation_cost - social_ref_cost) / social_ref_cost)
+    else:
+        out["operation_cost_gap_pct"] = 0.0
+
+    pv = float(out.get("PV_energy_mwh", 0.0) or 0.0)
+    wt = float(out.get("WT_energy_mwh", 0.0) or 0.0)
+    der = float(out.get("der_energy_mwh", 0.0) or 0.0)
+    out["renewable_energy_mwh"] = pv + wt
+    out["renewable_share_pct"] = 100.0 * (pv + wt) / max(der, 1e-9)
+    out["feasible_status"] = out.get("postprocess_status", "")
+    out["feasible_rate_pct"] = feasible_rate_from_status(
+        out.get("postprocess_status", ""))
+    out["utility_shortfall_cost"] = max(
+        0.0, -float(out.get("utility_min", 0.0) or 0.0))
+    return out
+
+
 def evaluate_posted_price_mechanism(name: str, category: str,
                                     settlement: str, mech,
                                     net: dict, types: torch.Tensor,
@@ -236,6 +301,112 @@ def evaluate_social_optimum(net: dict, types: torch.Tensor,
         source_types=source_types,
     )
     return add_metadata(row, "oracle", "true_cost_payment", "feasible")
+
+
+def evaluate_cooperative_disaggregation_baselines(
+        net: dict, types: torch.Tensor,
+        x_dispatch: torch.Tensor, P_dispatch: torch.Tensor,
+        x_social: torch.Tensor, source_types: list,
+        args) -> list:
+    """Shapley/nucleolus surplus disaggregation on a common dispatch."""
+    requested = tuple(args.cooperative_methods)
+    types_np = types.detach().cpu().numpy()
+    print("Computing cooperative surplus allocations: "
+          + ", ".join(requested))
+    payoff_np = cooperative_payoffs(
+        types_np,
+        net,
+        methods=requested,
+        nucleolus_tol=args.nucleolus_tol,
+    )
+    realized_cost = true_cost_total(types, x_dispatch)
+
+    rows = []
+    for method in requested:
+        payoff = torch.tensor(payoff_np[method], dtype=torch.float32,
+                              device=types.device)
+        p = realized_cost + payoff
+        if method == "shapley":
+            name = "shapley_value_disaggregation"
+            settlement = "shapley_surplus"
+        elif method == "nucleolus":
+            name = "nucleolus_disaggregation"
+            settlement = "nucleolus_surplus"
+        elif method == "vcg":
+            name = "vcg_disaggregation"
+            settlement = "vcg_marginal_contribution"
+        else:
+            name = f"{method}_disaggregation"
+            settlement = f"{method}_surplus"
+
+        row = metric_row(
+            name,
+            net,
+            types,
+            x_dispatch,
+            p,
+            P_dispatch,
+            x_social=x_social,
+            source_types=source_types,
+        )
+        row["cooperative_surplus"] = float(payoff.sum(dim=1).mean())
+        row["positive_adjustment_mwh"] = 0.0
+        row["positive_adjustment_payment"] = 0.0
+        row["postprocess_mt_slack_mwh"] = 0.0
+        row["postprocess_status"] = "not_applicable"
+        rows.append(add_metadata(
+            row,
+            "cooperative_disaggregation",
+            settlement,
+            "feasible",
+        ))
+    return rows
+
+
+def dlmp_price_tensor(net: dict, batch_size: int,
+                      device: torch.device) -> torch.Tensor:
+    """
+    Liu-style active-power DLMP approximation.
+
+    Liu et al. define DLMP as the active balance price plus loss and
+    network-dual adders. Our active-power model does not expose reactive
+    prices, so this baseline uses the active energy component with the
+    linearised loss-factor term already used by the local network helper:
+
+        lambda_i,t = pi_DA_t * (1 + LF_i).
+    """
+    pi = np.asarray(net["pi_DA_profile"], dtype=np.float32)
+    A_volt = np.asarray(net["A_volt"], dtype=np.float32)
+    v_base = np.asarray(net.get("v_base_profile", net.get("v_base")),
+                        dtype=np.float32)
+    denom = float(np.maximum(np.mean(v_base), 1e-6))
+    loss_factor = A_volt.sum(axis=0) / denom
+    dlmp = pi[:, None] * (1.0 + loss_factor[None, :])
+    dlmp = np.maximum(dlmp, 0.0).astype(np.float32)
+    return torch.tensor(dlmp, dtype=torch.float32, device=device
+                        ).unsqueeze(0).expand(batch_size, -1, -1)
+
+
+def evaluate_dlmp_baseline(net: dict, types: torch.Tensor,
+                           x_dispatch: torch.Tensor,
+                           P_dispatch: torch.Tensor,
+                           x_social: torch.Tensor,
+                           source_types: list) -> dict:
+    rho = dlmp_price_tensor(net, types.shape[0], types.device)
+    p = (rho * x_dispatch).sum(dim=1)
+    row = metric_row(
+        "dlmp_settlement",
+        net,
+        types,
+        x_dispatch,
+        p,
+        P_dispatch,
+        rho=rho,
+        x_social=x_social,
+        source_types=source_types,
+    )
+    row["postprocess_status"] = "not_applicable"
+    return add_metadata(row, "dlmp", "active_loss_dlmp", "feasible")
 
 
 def evaluate_bid_opf_baselines(net: dict, types: torch.Tensor,
@@ -327,10 +498,63 @@ def select_paper_rows(rows: list) -> list:
         name = row.get("name", "")
         category = row.get("category", "")
         stage = row.get("stage", "")
-        if category in {"oracle", "bid_dependent_opf"}:
+        if category in {"oracle", "bid_dependent_opf",
+                        "cooperative_disaggregation", "dlmp"}:
             out.append(row)
-        elif category in {"fixed_price", "learned_posted_price"} and stage == "post":
+        elif category in {"learned_posted_price"} and stage == "post":
             out.append(row)
+    return out
+
+
+def _as_float(value):
+    try:
+        if value in ("", None):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def aggregate_paper_rows(rows: list) -> list:
+    """Average selected paper rows across ERCOT scenarios, when applicable."""
+    grouped = {}
+    key_cols = ("name", "category", "settlement", "stage", "checkpoint")
+    for row in rows:
+        key = tuple(row.get(col, "") for col in key_cols)
+        grouped.setdefault(key, []).append(row)
+
+    out = []
+    for _key, group in grouped.items():
+        if len(group) == 1:
+            row = dict(group[0])
+            row["n_eval_rows"] = 1
+            out.append(row)
+            continue
+
+        merged = dict(group[0])
+        all_cols = sorted({k for row in group for k in row})
+        for col in all_cols:
+            vals = [row.get(col, "") for row in group]
+            nums = [_as_float(v) for v in vals]
+            if col in {"scenario_idx", "scenario_date"}:
+                merged[col] = "multiple"
+            elif all(v is not None for v in nums):
+                if col == "utility_min":
+                    merged[col] = float(np.min(nums))
+                elif col == "utility_shortfall_cost":
+                    merged[col] = float(np.max(nums))
+                elif col == "feasible_rate_pct":
+                    merged[col] = float(np.min(nums))
+                else:
+                    merged[col] = float(np.mean(nums))
+            elif len({str(v) for v in vals}) == 1:
+                merged[col] = vals[0]
+            elif col == "postprocess_status":
+                merged[col] = ";".join(sorted({str(v) for v in vals}))
+            else:
+                merged[col] = vals[0]
+        merged["n_eval_rows"] = len(group)
+        out.append(merged)
     return out
 
 
@@ -348,6 +572,14 @@ def parse_args():
     ])
     parser.add_argument("--samples", type=int, default=24)
     parser.add_argument("--seed", type=int, default=20260426)
+    parser.add_argument("--data-source", choices=["ercot", "liu"],
+                        default="ercot",
+                        help="Evaluation profile source. ERCOT is the paper default.")
+    parser.add_argument("--scenario-idx", type=int, default=0,
+                        help="ERCOT typical-day scenario index when not using all scenarios.")
+    parser.add_argument("--all-ercot-scenarios", action="store_true",
+                        help="Evaluate all ERCOT typical-day scenarios and aggregate the table.")
+    parser.add_argument("--pi-clip-factor", type=float, default=3.0)
     parser.add_argument("--ctrl-min-ratio", type=float, default=0.15)
     parser.add_argument("--pi-buyback-ratio", type=float, default=0.1)
     parser.add_argument("--peer-bid-scale", type=float, default=0.25)
@@ -359,8 +591,16 @@ def parse_args():
     parser.add_argument("--fixed-price-ratios", nargs="*", type=float,
                         default=[0.5, 0.7, 1.0],
                         help="Uniform fixed-price ratios relative to pi_DA.")
+    parser.add_argument("--include-fixed-price", action="store_true",
+                        help="Include fixed posted-price baselines.")
     parser.add_argument("--skip-fixed-price", action="store_true")
     parser.add_argument("--skip-bid-opf", action="store_true")
+    parser.add_argument("--skip-dlmp", action="store_true")
+    parser.add_argument("--skip-cooperative-disaggregation", action="store_true")
+    parser.add_argument("--cooperative-methods", nargs="*",
+                        default=["vcg", "shapley", "nucleolus"],
+                        choices=["vcg", "shapley", "nucleolus"])
+    parser.add_argument("--nucleolus-tol", type=float, default=1e-7)
     parser.add_argument("--skip-public-context-ablation", action="store_true")
     parser.add_argument("--adjustment-weight", type=float, default=1.0)
     parser.add_argument("--settlement-weight", type=float, default=1e-3)
@@ -370,19 +610,34 @@ def parse_args():
     return parser.parse_args()
 
 
-def main():
-    args = parse_args()
-    run_dir = (os.path.abspath(args.run) if args.run
-               else default_run_for_checkpoints(_ROOT, args.checkpoints))
-    out_dir = args.out_dir or os.path.join(_THIS_DIR, "results")
-    os.makedirs(out_dir, exist_ok=True)
-
-    net = build_network_multi(
+def build_eval_network(args, scenario_idx):
+    if args.data_source == "ercot":
+        return build_network_multi(
+            scenario_idx=int(scenario_idx),
+            ctrl_min_ratio=args.ctrl_min_ratio,
+            pi_clip_factor=args.pi_clip_factor,
+        )
+    return build_network_multi(
         constant_price=False,
         ctrl_min_ratio=args.ctrl_min_ratio,
     )
+
+
+def scenario_indices(args):
+    if args.data_source != "ercot":
+        return [None]
+    if args.all_ercot_scenarios:
+        if ercot_num_scenarios is None:
+            raise RuntimeError("ERCOT profiles are not available.")
+        return list(range(ercot_num_scenarios()))
+    return [args.scenario_idx]
+
+
+def evaluate_one_setting(args, run_dir: str, scenario_idx=None) -> list:
+    net = build_eval_network(args, 0 if scenario_idx is None else scenario_idx)
     prior = DERTypePriorMulti(net)
-    torch.manual_seed(args.seed)
+    seed_offset = 0 if scenario_idx is None else int(scenario_idx)
+    torch.manual_seed(args.seed + seed_offset)
     types = prior.sample(args.samples, device="cpu")
     source_types = classify_sources(net)
 
@@ -404,11 +659,20 @@ def main():
         evaluate_social_optimum(net, types, x_soc, p_soc, P_soc, source_types)
     ]
 
+    if not args.skip_cooperative_disaggregation:
+        rows.extend(evaluate_cooperative_disaggregation_baselines(
+            net, types, x_soc, P_soc, x_soc, source_types, args))
+
+    if not args.skip_dlmp:
+        print("Evaluating DLMP settlement baseline...")
+        rows.append(evaluate_dlmp_baseline(
+            net, types, x_soc, P_soc, x_soc, source_types))
+
     if not args.skip_bid_opf:
         print("Evaluating bid-dependent OPF settlement baselines...")
         rows.extend(evaluate_bid_opf_baselines(net, types, x_soc, source_types))
 
-    if not args.skip_fixed_price:
+    if args.include_fixed_price and not args.skip_fixed_price:
         for ratio in args.fixed_price_ratios:
             print(f"Evaluating fixed posted price ratio={ratio:.3f}...")
             fixed = FixedPostedPriceMechanism(
@@ -470,8 +734,31 @@ def main():
                 run_dir=run_dir,
             ))
 
+    for row in rows:
+        row["data_source"] = args.data_source
+        row["scenario_idx"] = "" if scenario_idx is None else int(scenario_idx)
+        row["scenario_date"] = str(net.get("scenario_date", "liu"))
+    social_ref_cost = rows[0]["social_cost_true"]
+    return [add_table_metrics(row, social_ref_cost) for row in rows]
+
+
+def main():
+    args = parse_args()
+    run_dir = (os.path.abspath(args.run) if args.run
+               else default_run_for_checkpoints(_ROOT, args.checkpoints))
+    out_dir = args.out_dir or os.path.join(_THIS_DIR, "results")
+    os.makedirs(out_dir, exist_ok=True)
+
+    rows = []
+    for sc in scenario_indices(args):
+        label = "Liu profiles" if sc is None else f"ERCOT scenario {sc}"
+        print("\n" + "=" * 80)
+        print(f"Experiment 1 setting: {label}")
+        print("=" * 80)
+        rows.extend(evaluate_one_setting(args, run_dir, sc))
+
     detailed_path = os.path.join(out_dir, "overall_performance_detailed.csv")
-    paper_rows = select_paper_rows(rows)
+    paper_rows = aggregate_paper_rows(select_paper_rows(rows))
     paper_csv_path = os.path.join(out_dir, "overall_performance_table.csv")
     paper_md_path = os.path.join(out_dir, "overall_performance_table.md")
     config_path = os.path.join(out_dir, "overall_performance_config.json")
@@ -492,10 +779,10 @@ def main():
     for row in paper_rows:
         print(
             f"  {row['name']:<45} "
-            f"cost={fmt_value(row.get('procurement_cost')):<10} "
-            f"rent={fmt_value(row.get('info_rent')):<10} "
-            f"MTgap={fmt_value(row.get('mt_floor_gap_mwh')):<10} "
-            f"corr={fmt_value(row.get('positive_adjustment_mwh'))}"
+            f"op={fmt_value(row.get('operation_cost')):<10} "
+            f"rent={fmt_value(row.get('info_rent_cost')):<10} "
+            f"total={fmt_value(row.get('total_procurement_cost')):<10} "
+            f"gap={fmt_value(row.get('operation_cost_gap_pct'))}%"
         )
 
 
