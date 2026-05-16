@@ -41,6 +41,9 @@ from our_method.vpp_mechanism_multi import VPPMechanismMulti  # noqa: E402
 
 
 DETAIL_COLUMNS = [
+    "data_source",
+    "scenario_idx",
+    "scenario_date",
     "method",
     "stage",
     "coalition_id",
@@ -85,6 +88,9 @@ DETAIL_COLUMNS = [
 ]
 
 WORST_COLUMNS = [
+    "data_source",
+    "scenario_idx",
+    "scenario_date",
     "method",
     "stage",
     "coalition_group",
@@ -108,6 +114,9 @@ WORST_COLUMNS = [
 ]
 
 HEADLINE_COLUMNS = [
+    "data_source",
+    "scenario_idx",
+    "scenario_date",
     "method",
     "stage",
     "n_size_buckets",
@@ -421,6 +430,7 @@ def offer_cap_delta(truth_eval: dict, mis_eval: dict) -> object:
 
 
 def make_detail_row(method: str, stage: str, coalition: dict, spec: dict,
+                    scenario_meta: dict,
                     truth_eval: dict, mis_eval: dict) -> dict:
     truth = truth_eval[stage]
     mis = mis_eval[stage]
@@ -433,6 +443,9 @@ def make_detail_row(method: str, stage: str, coalition: dict, spec: dict,
     regret = np.maximum(coalition_gain, 0.0)
 
     row = {
+        "data_source": scenario_meta["data_source"],
+        "scenario_idx": scenario_meta["scenario_idx"],
+        "scenario_date": scenario_meta["scenario_date"],
         "method": method,
         "stage": stage,
         "coalition_id": coalition["coalition_id"],
@@ -494,6 +507,9 @@ def summarize_details(rows: list) -> list:
         method, stage, coalition_group, size, strategy = key
         worst = max(group, key=lambda r: r["coalition_regret_mean"])
         out.append({
+            "data_source": group[0].get("data_source", ""),
+            "scenario_idx": group[0].get("scenario_idx", ""),
+            "scenario_date": group[0].get("scenario_date", ""),
             "method": method,
             "stage": stage,
             "coalition_group": coalition_group,
@@ -553,6 +569,9 @@ def headline_summary(worst_rows: list) -> list:
     for (method, stage), group in sorted(grouped.items()):
         worst = max(group, key=lambda r: r["coalition_regret_mean"])
         out.append({
+            "data_source": worst.get("data_source", ""),
+            "scenario_idx": worst.get("scenario_idx", ""),
+            "scenario_date": worst.get("scenario_date", ""),
             "method": method,
             "stage": stage,
             "n_size_buckets": len(group),
@@ -579,6 +598,9 @@ def size_curve(worst_rows: list) -> list:
     out = []
     for row in worst_rows:
         out.append({
+            "data_source": row.get("data_source", ""),
+            "scenario_idx": row.get("scenario_idx", ""),
+            "scenario_date": row.get("scenario_date", ""),
             "method": row["method"],
             "stage": row["stage"],
             "coalition_group": row["coalition_group"],
@@ -637,9 +659,14 @@ def write_markdown(path: str, rows: list, cols: list):
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--run", default=None)
-    parser.add_argument("--checkpoint", default="model_best_constr.pth")
+    parser.add_argument("--checkpoint", default="model_best.pth")
     parser.add_argument("--samples", type=int, default=12)
     parser.add_argument("--seed", type=int, default=20260426)
+    parser.add_argument("--data-source", choices=["ercot", "liu"],
+                        default="ercot")
+    parser.add_argument("--scenario-idx", type=int, default=17,
+                        help="ERCOT typical-day scenario index for this single-day stress test.")
+    parser.add_argument("--pi-clip-factor", type=float, default=3.0)
     parser.add_argument("--coalition-seed", type=int, default=20260507)
     parser.add_argument("--ctrl-min-ratio", type=float, default=0.15)
     parser.add_argument("--pi-buyback-ratio", type=float, default=0.1)
@@ -666,19 +693,39 @@ def parse_args():
     return parser.parse_args()
 
 
+def build_eval_network(args) -> dict:
+    if args.data_source == "ercot":
+        return build_network_multi(
+            scenario_idx=int(args.scenario_idx),
+            ctrl_min_ratio=args.ctrl_min_ratio,
+            pi_clip_factor=args.pi_clip_factor,
+        )
+    return build_network_multi(
+        constant_price=False,
+        ctrl_min_ratio=args.ctrl_min_ratio,
+    )
+
+
+def scenario_metadata(args, net: dict) -> dict:
+    return {
+        "data_source": args.data_source,
+        "scenario_idx": "" if args.data_source != "ercot" else int(args.scenario_idx),
+        "scenario_date": str(net.get("scenario_date", "liu")),
+    }
+
+
 def main():
     args = parse_args()
     run_dir = (os.path.abspath(args.run) if args.run
                else default_run_for_checkpoint(_ROOT, args.checkpoint))
-    out_dir = args.out_dir or os.path.join(_THIS_DIR, "results")
+    out_dir = args.out_dir or os.path.join(_THIS_DIR, "results_ercot_single_day")
     os.makedirs(out_dir, exist_ok=True)
 
-    net = build_network_multi(
-        constant_price=False,
-        ctrl_min_ratio=args.ctrl_min_ratio,
-    )
+    net = build_eval_network(args)
+    scenario_meta = scenario_metadata(args, net)
     prior = DERTypePriorMulti(net)
-    torch.manual_seed(args.seed)
+    seed_offset = 0 if args.data_source != "ercot" else int(args.scenario_idx)
+    torch.manual_seed(args.seed + seed_offset)
     types = prior.sample(args.samples, device="cpu")
     types_np = to_numpy(types)
     labels = list(net["der_labels"])
@@ -688,6 +735,11 @@ def main():
     if not coalitions:
         raise RuntimeError("No coalitions were generated. Check --coalition-groups.")
 
+    print(
+        f"Coalition stress setting: {scenario_meta['data_source']} "
+        f"idx={scenario_meta['scenario_idx']} "
+        f"date={scenario_meta['scenario_date']}"
+    )
     print(f"Generated {len(coalitions)} coalition candidates.")
     print(f"Generated {len(strategy_specs)} coalition strategies.")
 
@@ -745,7 +797,8 @@ def main():
                 mis_eval = eval_fn(bids)
                 for stage in stages:
                     detailed_rows.append(make_detail_row(
-                        method, stage, coalition, spec, truth_eval, mis_eval))
+                        method, stage, coalition, spec, scenario_meta,
+                        truth_eval, mis_eval))
 
     summary_rows = summarize_details(detailed_rows)
     worst_rows = worst_by_size(detailed_rows)
@@ -770,6 +823,7 @@ def main():
         config = vars(args).copy()
         config["run_dir"] = run_dir
         config["root"] = _ROOT
+        config.update(scenario_meta)
         config["coalitions"] = coalitions
         config["strategies"] = strategy_specs
         json.dump(config, f, indent=2)
